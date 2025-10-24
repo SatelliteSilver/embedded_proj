@@ -1,3 +1,44 @@
+//현재 최종본//
+#include <SoftwareSerial.h>
+
+SoftwareSerial BTSerial(2, 3);
+//SoftwareSerial mySerial(6, 7); 
+
+void setup() {
+  Serial.begin(115200);
+  BTSerial.begin(115200); 
+  
+}
+//목표
+//1015가 들어올 때 10, 15로 나눠서 처리할 방법?
+//a==10, b==15 충족 시 속도 v=10 a=15로 송신
+//문자열 커팅 구현
+
+void loop() {
+  if (BTSerial.available()) {
+    char c = BTSerial.read();
+    if(c == 1)
+    Serial.print("v10a10s10");
+
+    if(c == 5)
+    Serial.print("v50a50s50");
+    // char c = BTSerial.read();
+    // Serial.print((int)c);
+    delay(1000);
+  }
+  
+ //Serial.println("");
+  if (Serial.available()) {
+    char c = Serial.read();
+    BTSerial.write(c);
+    //Serial.print((int)c);
+    // Serial.println("v10a10s10");
+  }
+}
+
+//------------------------------------------------------------------------//
+
+
 // header
 #include <SoftwareSerial.h>
 
