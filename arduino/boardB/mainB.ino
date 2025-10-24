@@ -29,3 +29,27 @@ void loop() {
     BTSerial.write(data);
   }
 }
+
+//아스키코드 그대로 출력
+// #include <SoftwareSerial.h>
+
+// SoftwareSerial BTSerial(2, 3);
+
+// void setup() {
+//   Serial.begin(115200);
+//   BTSerial.begin(115200); 
+// }
+
+// void loop() {
+//   if (BTSerial.available()) {
+//     char c = BTSerial.read();
+//     Serial.print((int)c);
+//   }
+  
+//   if (Serial.available()) {
+//     char c = Serial.read();
+//     BTSerial.write(c);
+//     Serial.print((int)c);
+//   }
+// }
+
