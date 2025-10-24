@@ -46,7 +46,7 @@ RobotState currentState = IDLE;
 unsigned long moveStartTime = 0;
 
 // ----- UART 통신 설정 -----
-#define UART_BAUD_RATE 9600
+#define UART_BAUD_RATE 115200
 // mySerial 객체 삭제
 
 #define UART_BUFFER_SIZE 32
@@ -285,7 +285,9 @@ void handleUartInput() {
 
   if (mySerial.available()) { // [수정] mySerial -> Serial
     char incomingByte = mySerial.read(); // [수정] mySerial -> Serial
-
+    mySerial.write("Network confirm from A");
+    
+    Serial.write(incomingByte);
     if (incomingByte == '\n' || incomingByte == '\r') {
       if (uartBufferIndex > 0) {
         uartBuffer[uartBufferIndex] = '\0';
@@ -323,7 +325,7 @@ void handleUartInput() {
 
 void setup() {
   Serial.begin(UART_BAUD_RATE); // [수정] 통신용 Serial 시작 (9600)
-  mySerial.begin(9600);
+  mySerial.begin(115200);
 
   pinMode(ENA, OUTPUT); pinMode(ENB, OUTPUT);
   pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
