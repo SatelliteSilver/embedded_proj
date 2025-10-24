@@ -327,18 +327,24 @@ def do_attack():
     s_val = 1    # 상태 or 플래그
 
     # 메시지 구성: v <50> a <50> s <1>
-    msg = bytearray([
-        ord('v'), v_val & 0xFF,
-        ord('a'), a_val & 0xFF,
-        ord('s'), s_val & 0xFF
-    ])
+    msg = 'v10a10s10\n'
+        
+    #     bytearray([
+    #     ord('v'), v_val & 0xFF,
+    #     ord('a'), a_val & 0xFF,
+    #     ord('s'), s_val & 0xFF
+    # ])
 
     try:
-        ser_bt.write(msg)
-        time.sleep(0.05)  # 블루투스 안정화
-        print("[BT TX - RAW BYTES]", list(msg))  # 사람이 보기 쉽게 출력
-        info("테스트 명령 전송 완료. OK 신호 대기중...")
-        waiting_ok = True
+        for ch in msg:
+            ser_bt.write(ch.encode('utf-8'))  # 문자 하나를 바이트로 변환해 전송
+        # print(f"[TX] '{ch}' -> {ord(ch)}")  # 로그: 문자와 ASCII 코드 출력
+        # time.sleep(0.01)  # (선택) 약간의 지연으로 안정성 확보
+            #ser_bt.write(msg)
+            time.sleep(0.05)  # 블루투스 안정화
+            print("[BT TX - RAW BYTES]", list(msg))  # 사람이 보기 쉽게 출력
+            info("테스트 명령 전송 완료. OK 신호 대기중...")
+            waiting_ok = True
     except Exception as e:
         info(f"전송 실패: {e}")
 
