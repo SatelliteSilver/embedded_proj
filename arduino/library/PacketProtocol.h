@@ -1,6 +1,6 @@
 //
 // PacketProtocol.h
-// 32bit UART defining packData and bit utility unpack
+// 32bit UART 데이터 패킷 정의 및 비트 해석 유틸
 //
 
 #ifndef PACKET_PROTOCOL_H
@@ -10,41 +10,43 @@
 
 // 데이터 필드 구조 정의
 struct PacketData {
-  uint8_t speed_type;   // 2bit
-  uint8_t speed_val;    // 3bit
-  uint8_t accel_type;   // 2bit
-  uint8_t accel_val;    // 3bit
-  uint8_t stop_flag;    // 2bit
-  uint8_t custom_flag;  // 1bit
-  uint8_t reserved;     // 3bit (redundancy bits)
+  uint8_t speed_val;     // 8bit 속도값
+  bool accel_sign;        // 1bit 가속도 부호 (0: +, 1: -)
+  uint8_t accel_val;      // 7bit 가속도값
+  bool stop_flag;         // 1bit stop_flag (S) - 1일 때만 TX
+  uint16_t reserved;      // 9bit redundant bits
 };
 
 // ===============================
 // 32bit 패킷 생성 (pack)
 // ===============================
-uint32_t packData(uint8_t speed_type,  uint8_t speed_val,
-                  uint8_t accel_type,  uint8_t accel_sign,
-                  uint8_t accel_val,   uint8_t stop_flag,
-                  uint8_t custom_flag, uint8_t reserved)
+uint32_t packData(uint8_t speed_val, bool accel_sign, uint8_t accel_val, 
+                  bool stop_flag, uint16_t reserved)
 {
-  // 1. 패킷 변수는 32비트
   uint32_t packet = 0;
 
-  // speed_type (2 bits) : bits 31-30 
-  packet |= (uint32_t)(speed_type & 0x03) << 30; // 30bits shift
-  // speed_val (8 bits) : bits 29-22 (0-255의 unsigned 값)
-  packet |= (uint32_t)(speed_val & 0xFF) << 22; // 22bits shift
-  // accel_type (2 bits) : bits 21-20
-  packet |= (uint32_t)(accel_type & 0x03) << 20; // 20bits shift
-  // accel_sign (1 bit) : bit 19
-  packet |= (uint32_t)(accel_sign & 0x01) << 19; // 19bits shift
-  // accel_val (7 bits) : bits 18-12 (0-127의 절대값) 7비트 마스크(0x7F) 사용
-  packet |= (uint32_t)(accel_val & 0x7F) << 12; // 12bits shift
-  // stop_flag (2 bits) : bits 11-10
-  packet |= (uint32_t)(stop_flag & 0x03) << 10;
-  // custom_flag (1 bit) : bit 9
-  packet |= (uint32_t)(custom_flag & 0x01) << 9;
-  // reserved (9 bits) : bits 8-0 (시프트 없음, 9비트 마스크 0x1FF)
+  // 비트 31-30: 01 (고정)
+  packet |= 0x40000000;
+  
+  // 비트 29-22: 속도값 (8bit)
+  packet |= (uint32_t)(speed_val & 0xFF) << 22;
+  
+  // 비트 21-20: 10 (고정)
+  packet |= 0x200000;
+  
+  // 비트 19: 부호 비트 (0: +, 1: -)
+  packet |= (uint32_t)(accel_sign ? 1 : 0) << 19;
+  
+  // 비트 18-12: 가속도값 (7bit)
+  packet |= (uint32_t)(accel_val & 0x7F) << 12;
+  
+  // 비트 11-10: 11 (고정)
+  packet |= 0xC00;
+  
+  // 비트 9: stop_flag
+  packet |= (uint32_t)(stop_flag ? 1 : 0) << 9;
+  
+  // 비트 8-0: redundant bits (9bit)
   packet |= (uint32_t)(reserved & 0x1FF);
 
   return packet;
@@ -55,25 +57,20 @@ uint32_t packData(uint8_t speed_type,  uint8_t speed_val,
 // ===============================
 void unpackData(uint32_t packet, PacketData &data)
 {
-  // 32비트 구조에 맞게 시프트(>>) 및 마스크(&) 값 변경
-
-  // speed_type (2 bits) : bits 31-30
-  data.speed_type   = (packet >> 30) & 0x03;
-  // speed_val (8 bits) : bits 29-22
-  data.speed_val    = (packet >> 22) & 0xFF; // 8비트 마스크
-  // accel_type (2 bits) : bits 21-20
-  data.accel_type   = (packet >> 20) & 0x03;
-  // accel_sign (1 bit) : bit 19 (새로 추가)
-  data.accel_sign   = (packet >> 19) & 0x01;
-  // accel_val (7 bits) : bits 18-12
-  data.accel_val    = (packet >> 12) & 0x7F; // 7비트 마스크
-  // stop_flag (2 bits) : bits 11-10
-  data.stop_flag    = (packet >> 10) & 0x03;
-  // custom_flag (1 bit) : bit 9
-  data.custom_flag  = (packet >> 9)  & 0x01;
-  // reserved (9 bits) : bits 8-0
-  data.reserved     = (packet >> 0)  & 0x1FF; // 9비트 마스크
+  // 비트 29-22: 속도값
+  data.speed_val = (packet >> 22) & 0xFF;
+  
+  // 비트 19: 부호 비트
+  data.accel_sign = (packet >> 19) & 0x01;
+  
+  // 비트 18-12: 가속도값
+  data.accel_val = (packet >> 12) & 0x7F;
+  
+  // 비트 9: stop_flag
+  data.stop_flag = (packet >> 9) & 0x01;
+  
+  // 비트 8-0: redundant bits
+  data.reserved = packet & 0x1FF;
 }
-
 
 #endif // PACKET_PROTOCOL_H
