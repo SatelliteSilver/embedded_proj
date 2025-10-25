@@ -103,15 +103,10 @@ float Kd = 0.1f;
 // 회전 속도는 pid 제어에 따라 min ~ max, 직진 속도는 입력값
 
 const int MIN_PWM = 70;
-
-const int MAX_PWM = 80; // 회전 최대 속도 (setMotorSpeedDifferential에서 사용)
-
-const int MAX_MOVE_PWM = 150; // 직진 최대 속도 (moveAtSpeed에서 사용)
-
+const int MAX_PWM = 100; // 회전 최대 속도 (setMotorSpeedDifferential에서 사용)
+const int MAX_MOVE_PWM = 100; // 직진 최대 속도 (moveAtSpeed에서 사용)
 const int INITIAL_MOVE_SPEED = 50;
-
 const int INITIAL_MOVE_DURATION = 500; // ms
-
 const unsigned long MOVE_DURATION = 2000; // ms
 
 
@@ -157,15 +152,13 @@ static inline float wrap360(float angle) {
 
 
 static inline float angleDiff(float target, float current) {
-
-  float diff = wrap360(target) - wrap360(current);
-
-  if (diff >= 180.0f)  diff -= 360.0f;
-
-  if (diff < -180.0f)  diff += 360.0f;
-
+  float diff = target - current;
+  
+  // -180 ~ +180 범위로 정규화 (가장 짧은 경로)
+  while (diff > 180.0f) diff -= 360.0f;
+  while (diff < -180.0f) diff += 360.0f;
+  
   return diff;
-
 }
 
 
@@ -246,7 +239,7 @@ void driveOneMotor(int EN_pin, int IN1_pin, int IN2_pin, int speed) {
 
 
 
-// ===> 주의: 이 함수는 이전 버전 함수입니다. 방향 문제가 해결된 탱크 턴 함수 사용을 권장합니다. <===
+// 개선된 탱크 턴 함수 - 회전 방향 문제 해결
 
 void setMotorSpeedDifferential(int leftSpeed, int rightSpeed) {
 
@@ -272,37 +265,17 @@ void setMotorSpeedDifferential(int leftSpeed, int rightSpeed) {
 
 
 
-  int actualLeftSpeed = 0, actualRightSpeed = 0;
-
-  int turnPWM;
-
-
-
-  // 이 로직은 PID 결과(correction)를 어떻게 해석하느냐에 따라 방향이 달라질 수 있습니다.
-
-  if (abs(rightSpeed) >= abs(leftSpeed)) {   // 우회전 시도 시 rightSpeed 크기가 더 크다고 가정
-
-    turnPWM = max(MIN_PWM, abs(rightSpeed));
-
-    actualLeftSpeed = -turnPWM; // 왼쪽 뒤로
-
-    actualRightSpeed =  turnPWM; // 오른쪽 앞으로
-
-  } else {                                   // 좌회전 시도 시 leftSpeed 크기가 더 크다고 가정
-
-    turnPWM = max(MIN_PWM, abs(leftSpeed));
-
-    actualLeftSpeed =  turnPWM; // 왼쪽 앞으로
-
-    actualRightSpeed = -turnPWM; // 오른쪽 뒤로
-
+  // MIN_PWM 데드존 처리
+  if (abs(leftSpeed) < MIN_PWM && leftSpeed != 0) {
+    leftSpeed = (leftSpeed > 0) ? MIN_PWM : -MIN_PWM;
+  }
+  if (abs(rightSpeed) < MIN_PWM && rightSpeed != 0) {
+    rightSpeed = (rightSpeed > 0) ? MIN_PWM : -MIN_PWM;
   }
 
-
-
-  driveOneMotor(ENA, IN1, IN2, actualLeftSpeed);
-
-  driveOneMotor(ENB, IN3, IN4, actualRightSpeed);
+  // 직접 모터 제어 (개선된 방향)
+  driveOneMotor(ENA, IN1, IN2, leftSpeed);   // 왼쪽 모터
+  driveOneMotor(ENB, IN3, IN4, rightSpeed);  // 오른쪽 모터
 
 }
 
@@ -514,9 +487,8 @@ void updateHeadingFused() {
 
 
 
-  // 방향 반전 (시계방향+ 되도록)
-
-  float measured = wrap360(360.0f - rawYaw360);
+  // 방향 반전 (시계반대방향+ 되도록) - IMU 방향 문제 해결
+  float measured = rawYaw360; // IMU 방향을 그대로 사용
 
 
 
@@ -630,7 +602,10 @@ bool rotateToAbsAngle(float targetAbsAngle) {
 
       lastPrintMs = millis();
 
-      dbgPrintStateLine("[ROT]", error);
+      Serial.print("[ROT] Target="); Serial.print(targetAbsAngle, 1);
+      Serial.print(" Current="); Serial.print(currentHeading, 1);
+      Serial.print(" Error="); Serial.print(error, 1);
+      Serial.print(" Correction="); Serial.println(correction);
 
     }
 
@@ -678,14 +653,26 @@ bool rotateToAbsAngle(float targetAbsAngle) {
 
 
 
-    // 모터 구동 (탱크 턴)
-
-    // ===> 주의: setMotorSpeedDifferential 함수 로직과 방향 일치 확인 필요 <===
-
-    int leftSpeed  = -correction; // correction > 0 (오른쪽) -> 왼쪽 후진
-
-    int rightSpeed =  correction; // correction > 0 (오른쪽) -> 오른쪽 전진
-
+    // 모터 구동 (탱크 턴) - IMU 방향에 맞춘 회전 방향
+    // error > 0: 시계방향 회전 필요, error < 0: 시계반대방향 회전 필요
+    int leftSpeed, rightSpeed;
+    
+    if (error > 0) {
+      // 시계방향 회전: 왼쪽 전진, 오른쪽 후진
+      leftSpeed = abs(correction);
+      rightSpeed = -abs(correction);
+    } else {
+      // 시계반대방향 회전: 왼쪽 후진, 오른쪽 전진  
+      leftSpeed = -abs(correction);
+      rightSpeed = abs(correction);
+    }
+    
+    // 디버그: 모터 속도 출력
+    if (DEBUG && millis() - lastPrintMs >= 100) {
+      Serial.print(" L="); Serial.print(leftSpeed);
+      Serial.print(" R="); Serial.println(rightSpeed);
+    }
+    
     setMotorSpeedDifferential(leftSpeed, rightSpeed);
 
 
@@ -754,13 +741,21 @@ void handleInputFrom(Stream &port) {
 
       imuUpdate(); updateHeadingFused(); // 센서값 최신화
 
+      // 완전 리셋
       yawZeroOffset = lastOutYaw;      // 현재 내부 Yaw 값을 오프셋으로 저장
+      initialHeading = 0.0f;           // 초기 헤딩을 0으로 설정
+      targetAngle = 0.0f;              // 목표 각도도 0으로 리셋
+      
+      // 상태도 초기화
+      currentState = IDLE;
+      newCommandReceived = false;
+      targetSpeed = 0;
+      
+      // 모터 정지
+      setMotorSpeedDifferential(0, 0);
+      moveAtSpeed(0);
 
-      initialHeading = currentHeading; // 현재 헤딩(거의 0)을 새 기준으로 설정
-
-      targetAngle    = initialHeading; // 목표 각도도 리셋
-
-      Serial.println("[ZERO] heading set to 0 deg"); // PC로 메시지 출력
+      Serial.println("[ZERO] Complete reset - all axes to 0 deg"); // PC로 메시지 출력
 
       uartBufferIndex = 0; // 명령어 버퍼 초기화
 
@@ -790,7 +785,10 @@ void handleInputFrom(Stream &port) {
 
           targetSpeed = constrain(receivedSpeed, 0, MAX_MOVE_PWM); // 직진 속도 설정 (0~150)
 
-          targetAngle = wrap360(initialHeading + receivedAngle); // 목표 절대 각도 계산
+          // 상대 각도 처리: 현재 헤딩에서 상대 각도만큼 회전
+          // +a는 왼쪽(시계반대), -a는 오른쪽(시계방향)
+          // IMU 방향에 맞춰 각도 계산
+          targetAngle = wrap360(currentHeading + receivedAngle);
 
 
 
@@ -802,7 +800,11 @@ void handleInputFrom(Stream &port) {
 
             Serial.print(" a_rel=");  Serial.print(receivedAngle, 1);
 
-            Serial.print(" -> tgtAbs="); Serial.println(targetAngle, 1);
+            Serial.print(" current="); Serial.print(currentHeading, 1);
+
+            Serial.print(" -> tgtAbs="); Serial.print(targetAngle, 1);
+            
+            Serial.print(" err="); Serial.println(angleDiff(targetAngle, currentHeading), 1);
 
           }
 
