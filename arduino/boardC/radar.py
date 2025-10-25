@@ -3,6 +3,7 @@ import serial
 import math
 import sys
 import time
+import struct
 
 # --- 시리얼 설정 (비블로킹) ---
 ser_radar = serial.Serial('COM14', 115200, timeout=0)  # ← 0: non-blocking
@@ -47,67 +48,56 @@ scale = MAX_RADIUS_PX / MAX_DIST_CM  # px/cm
 distance_map = [0 for _ in range(181)]
 
 # --- 클러스터링 파라미터 ---
-DIST_TOL = 12         # 같은 물체로 묶을 거리 허용(cm)
-ANGLE_GAP_MAX = 4     # 연속으로 인정할 최대 각도 간격(도)
-MIN_CLUSTER_SIZE = 3  # 최소 포인트 수
-BIG_DOT_RADIUS = 10   # 큰 원 반지름(픽셀)
-HIT_RADIUS = 14       # 마우스 클릭 판정 반경(픽셀)
+DIST_TOL = 12
+ANGLE_GAP_MAX = 4
+MIN_CLUSTER_SIZE = 3
+BIG_DOT_RADIUS = 10
+HIT_RADIUS = 14
 
-# 스윕 동안 수집한 포인트(각도, 거리)
+# --- 데이터 저장 ---
 sweep_points = []
-# 가장 최근 스윕에서 검출된 클러스터(큰 원으로 그림)
-latest_clusters = []   # list of dicts: {"angle":..., "dist":..., "span":...}
+latest_clusters = []
 
 # --- 상태 ---
-active_sweep = False         # 스윕 진행 중
-show_clusters_now = False    # 스윕 종료 후 클러스터 표시
-last_space_ts = 0            # SPACE 디바운스
-
-# 스윕 종료 판정
+active_sweep = False
+show_clusters_now = False
+last_space_ts = 0
 ANGLE_STABLE_TOL = 1
 STABLE_FRAMES = 12
 angle_stable_count = 0
-
 IDLE_END_SEC = 0.40
 MIN_SWEEP_POINTS = 12
 last_rx_ts = 0.0
 
-# 끝각(사용자 요청: 15°/165°)
 END_NEAR_DEG = 15
 def near_end(a): return (a <= END_NEAR_DEG) or (a >= 180 - END_NEAR_DEG)
 
-# --- UI: 버튼들 ---
+# --- UI 버튼 ---
 BTN_W, BTN_H = 110, 34
 BTN_PAD = 10
-
-# 1행: CAR, TARGET
 btn_target = pygame.Rect(WIDTH - BTN_PAD - BTN_W, BTN_PAD, BTN_W, BTN_H)
 btn_car    = pygame.Rect(btn_target.left - BTN_PAD - BTN_W, BTN_PAD, BTN_W, BTN_H)
-# 2행: DETECTION, ATTACK
 btn_detect = pygame.Rect(btn_car.left, btn_car.bottom + BTN_PAD, BTN_W, BTN_H)
 btn_attack = pygame.Rect(btn_target.left, btn_target.bottom + BTN_PAD, BTN_W, BTN_H)
+btn_block  = pygame.Rect(btn_car.left - BTN_PAD - BTN_W, btn_car.top, BTN_W, BTN_H)
 
-# UI 상태
-select_mode = None       # None / "CAR" / "TARGET"
-car_idx = None           # latest_clusters에서 CAR로 선택된 인덱스
-target_idx = None        # latest_clusters에서 TARGET로 선택된 인덱스
-attack_view = False      # ATTACK 후 CAR/TARGET만 보이게
-
-# 5단계: BT 전송 후 OK 대기 상태
+select_mode = None
+car_idx = None
+target_idx = None
+block_idx = None
+attack_view = False
 waiting_ok = False
 last_info_msg = ""
 last_info_time = 0.0
 
 # ---------- 유틸 ----------
 def pol_to_xy(a_deg, d_cm):
-    """화면 픽셀 좌표(아크 그릴 때 사용)"""
     rad = math.radians(a_deg)
     x = center_x + (d_cm * scale) * math.cos(rad)
     y = center_y - (d_cm * scale) * math.sin(rad)
     return int(x), int(y)
 
 def polar_to_xy_cm(a_deg, d_cm):
-    """로봇용 좌표(cm). 원점: 레이더 기준점, +x: 오른쪽, +y: 위쪽."""
     rad = math.radians(a_deg)
     x_cm = d_cm * math.cos(rad)
     y_cm = d_cm * math.sin(rad)
@@ -117,11 +107,10 @@ def process_clusters(points):
     if not points:
         return []
     pts = sorted(points, key=lambda x: x[0])
-
     clusters = []
     cur = [pts[0]]
     for i in range(1, len(pts)):
-        a_prev, d_prev = pts[i-1]
+        a_prev, d_prev = pts[i - 1]
         a, d = pts[i]
         if abs(d - d_prev) <= DIST_TOL and (a - a_prev) <= ANGLE_GAP_MAX:
             cur.append((a, d))
@@ -137,14 +126,13 @@ def process_clusters(points):
         angles = [g[0] for g in group]
         dists  = [g[1] for g in group]
         mean_a = int(round(sum(angles) / len(angles)))
-        mean_d = int(round(sum(dists)  / len(dists)))
+        mean_d = int(round(sum(dists) / len(dists)))
         span   = max(angles) - min(angles)
         if 0 < mean_d <= MAX_DIST_CM:
             result.append({"angle": mean_a, "dist": mean_d, "span": span})
     return result
 
 def hit_test_cluster(mx, my):
-    """마우스 좌표(mx,my)와 가장 가까운 클러스터를 찾아 HIT_RADIUS 내면 (idx, dist) 반환, 아니면 (None, None)"""
     if not show_clusters_now or active_sweep:
         return None, None
     best_idx, best_d = None, 1e9
@@ -162,12 +150,10 @@ def info(msg):
     last_info_msg = msg
     last_info_time = time.time()
 
-# --- 시리얼 라인 파서 (누적 버퍼 기반 비블로킹) ---
+# --- 시리얼 라인 파서 ---
 buf_radar = bytearray()
 buf_bt    = bytearray()
-
 def read_nonblocking_lines(ser, buf, max_lines=32):
-    """in_waiting만큼 즉시 읽고, 개행 기준으로 잘라 최대 max_lines개 반환"""
     lines = []
     try:
         n = ser.in_waiting
@@ -175,8 +161,8 @@ def read_nonblocking_lines(ser, buf, max_lines=32):
             chunk = ser.read(n)
             if chunk:
                 buf.extend(chunk)
-                parts = buf.split(b'\n')      # \r\n, \n 모두 지원
-                buf[:] = parts[-1]            # 마지막 조각은 미완성 → 버퍼에 남김
+                parts = buf.split(b'\n')
+                buf[:] = parts[-1]
                 for raw in parts[:-1]:
                     lines.append(raw.rstrip(b'\r').decode('utf-8', errors='ignore'))
                     if len(lines) >= max_lines:
@@ -217,7 +203,6 @@ def draw_line(a):
     pygame.draw.line(screen, GREEN, (center_x, center_y), (x, y), 2)
 
 def draw_memory_objects():
-    # 스윕 중일 때만 빨간 점
     if not active_sweep:
         return
     for a in range(181):
@@ -229,22 +214,18 @@ def draw_memory_objects():
 def draw_clusters():
     if not show_clusters_now:
         return
-
     def should_draw(idx):
         if not attack_view:
             return True
-        # ATTACK 이후엔 CAR/TARGET만
-        return (idx == car_idx) or (idx == target_idx)
+        return (idx == car_idx) or (idx == target_idx) or (idx == block_idx)
 
     for idx, obj in enumerate(latest_clusters):
         if not should_draw(idx):
             continue
         x, y = pol_to_xy(obj["angle"], obj["dist"])
-        # 기본(주황)
         pygame.draw.circle(screen, ORANGE, (x, y), BIG_DOT_RADIUS, width=2)
         pygame.draw.circle(screen, ORANGE, (x, y), 3)
         screen.blit(font.render(f'{obj["dist"]}cm', True, ORANGE), (x + 8, y - 8))
-        # 선택 강조
         labels = []
         if idx == car_idx:
             pygame.draw.circle(screen, CAR_COLOR, (x, y), BIG_DOT_RADIUS + 3, width=2)
@@ -252,56 +233,53 @@ def draw_clusters():
         if idx == target_idx:
             pygame.draw.circle(screen, TARGET_COLOR, (x, y), BIG_DOT_RADIUS + 6, width=2)
             labels.append("TARGET")
+        if idx == block_idx:   # ✅ BLOCK 표시 추가
+            pygame.draw.circle(screen, (180, 180, 255), (x, y), BIG_DOT_RADIUS + 4, width=2)
+            labels.append("BLOCK")
         if labels:
             tag = "/".join(labels)
             screen.blit(font_small.render(tag, True, WHITE), (x + 8, y + 8))
 
 def draw_text(a, d):
     d_clamped = d if 0 < d <= MAX_DIST_CM else 0
-    state = ("SWEEP" if active_sweep else
-             ("WAIT_OK" if waiting_ok else "HOLD"))
+    state = ("SWEEP" if active_sweep else ("WAIT_OK" if waiting_ok else "HOLD"))
     msg = f"[{state}] Angle: {a:3d}°   Distance: {d_clamped:3d} cm (max {MAX_DIST_CM} cm)"
     screen.blit(font.render(msg, True, WHITE), (20, 20))
-
-    # 하단 알림(3초 표시)
     if last_info_msg and (time.time() - last_info_time < 3.0):
         screen.blit(font.render(last_info_msg, True, WARN), (20, HEIGHT - 30))
 
 def draw_ui():
-    # 1행
     pygame.draw.rect(screen, UI_BG, btn_car, border_radius=8)
     pygame.draw.rect(screen, UI_BG, btn_target, border_radius=8)
+    pygame.draw.rect(screen, UI_BG, btn_block, border_radius=8)
     if select_mode == "CAR":
         pygame.draw.rect(screen, UI_ACTIVE, btn_car, border_radius=8)
     elif select_mode == "TARGET":
         pygame.draw.rect(screen, UI_ACTIVE, btn_target, border_radius=8)
+    elif select_mode == "BLOCK":
+        pygame.draw.rect(screen, UI_ACTIVE, btn_block, border_radius=8)
     pygame.draw.rect(screen, CAR_COLOR, btn_car, width=2, border_radius=8)
     pygame.draw.rect(screen, TARGET_COLOR, btn_target, width=2, border_radius=8)
-    screen.blit(font.render("CAR", True, CAR_COLOR),
-                (btn_car.centerx - font.size("CAR")[0]//2, btn_car.centery - font.get_height()//2))
-    screen.blit(font.render("TARGET", True, TARGET_COLOR),
-                (btn_target.centerx - font.size("TARGET")[0]//2, btn_target.centery - font.get_height()//2))
-
-    # 2행
+    pygame.draw.rect(screen, WHITE, btn_block, width=2, border_radius=8)
+    screen.blit(font.render("CAR", True, CAR_COLOR), (btn_car.centerx - 24, btn_car.centery - 10))
+    screen.blit(font.render("TARGET", True, TARGET_COLOR), (btn_target.centerx - 38, btn_target.centery - 10))
+    screen.blit(font.render("BLOCK", True, WHITE), (btn_block.centerx - 30, btn_block.centery - 10))
     pygame.draw.rect(screen, UI_BG, btn_detect, border_radius=8)
     pygame.draw.rect(screen, UI_BG, btn_attack, border_radius=8)
     pygame.draw.rect(screen, WHITE, btn_detect, width=2, border_radius=8)
     pygame.draw.rect(screen, WHITE, btn_attack, width=2, border_radius=8)
-    screen.blit(font.render("DETECTION", True, WHITE),
-                (btn_detect.centerx - font.size("DETECTION")[0]//2, btn_detect.centery - font.get_height()//2))
-    screen.blit(font.render("ATTACK", True, WHITE),
-                (btn_attack.centerx - font.size("ATTACK")[0]//2, btn_attack.centery - font.get_height()//2))
-
-    # 현재 선택 요약
+    screen.blit(font.render("DETECTION", True, WHITE), (btn_detect.centerx - 50, btn_detect.centery - 10))
+    screen.blit(font.render("ATTACK", True, WHITE), (btn_attack.centerx - 40, btn_attack.centery - 10))
     info_y = btn_detect.bottom + 6
     car_info = f"CAR: {'-' if car_idx is None else car_idx}"
     tgt_info = f"TGT: {'-' if target_idx is None else target_idx}"
+    blk_info = f"BLK: {'-' if block_idx is None else block_idx}"
     screen.blit(font_small.render(car_info, True, CAR_COLOR), (btn_car.left, info_y))
     screen.blit(font_small.render(tgt_info, True, TARGET_COLOR), (btn_target.left, info_y))
+    screen.blit(font_small.render(blk_info, True, WHITE), (btn_block.left, info_y))
 
-# ---------- 동작 함수들 ----------
+# ---------- 동작 함수 ----------
 def start_detection_sweep():
-    """DETECTION: 스윕 1회 시작"""
     global distance_map, sweep_points, latest_clusters
     global show_clusters_now, active_sweep, angle_stable_count
     global last_rx_ts, attack_view, waiting_ok
@@ -312,42 +290,179 @@ def start_detection_sweep():
     active_sweep = True
     angle_stable_count = 0
     last_rx_ts = time.time()
-    attack_view = False         # 새 스윕에서는 일반 표시
-    waiting_ok = False          # OK 대기 해제
-    ser_radar.write(b'S')             # 아두이노 트리거
+    attack_view = False
+    waiting_ok = False
+    ser_radar.write(b'S')
     print("[TX RADAR] start sweep")
 
+def draw_attack_path():
+    if not attack_view:
+        return
+    if car_idx is None or target_idx is None:
+        return
+
+    pts = []
+    car = latest_clusters[car_idx]
+    pts.append(pol_to_xy(car["angle"], car["dist"]))
+
+    if block_idx is not None:
+        blk = latest_clusters[block_idx]
+        pts.append(pol_to_xy(blk["angle"], blk["dist"]))
+
+    tgt = latest_clusters[target_idx]
+    pts.append(pol_to_xy(tgt["angle"], tgt["dist"]))
+
+    # 선 + 화살표 그리기
+    for i in range(1, len(pts)):
+        x0, y0 = pts[i - 1]
+        x1, y1 = pts[i]
+        pygame.draw.line(screen, (255, 200, 50), (x0, y0), (x1, y1), 3)
+
+        # --- 화살표 머리 ---
+        dx, dy = (x1 - x0), (y1 - y0)
+        ang = math.atan2(dy, dx)
+        arrow_len = 12
+        left = (x1 - arrow_len * math.cos(ang - 0.4),
+                y1 - arrow_len * math.sin(ang - 0.4))
+        right = (x1 - arrow_len * math.cos(ang + 0.4),
+                 y1 - arrow_len * math.sin(ang + 0.4))
+        pygame.draw.polygon(screen, (255, 200, 50), [(x1, y1), left, right])
+
+def build_packet(speed, angle, status):
+    if abs(angle) == 0:
+        angle_val = 0x00
+    elif angle > 0:
+        angle_val = angle & 0x7F
+    else:
+        angle_val = (abs(angle) & 0x7F) | 0x80
+    pkt = 0
+    pkt |= (0b01 << 30)
+    pkt |= (speed & 0xFF) << 22
+    pkt |= (0b10 << 20)
+    pkt |= (angle_val << 12)
+    pkt |= (0b11 << 10)
+    pkt |= (status & 0x1) << 9
+    return pkt
+
+def read_bt_binary():
+    if ser_bt.in_waiting >= 4:
+        data = ser_bt.read(4)
+        val = struct.unpack('>I', data)[0]
+        status = (val >> 9) & 0x1
+        return status
+    return None
+
 def do_attack():
-    """ATTACK 버튼 누르면 테스트용 명령 전송 (쉼표 없이 문자+숫자 바이트)"""
-    global waiting_ok
+    global waiting_ok, attack_view
+    if car_idx is None or target_idx is None:
+        info("CAR/TARGET not selected.")
+        return
 
-    # 보낼 값 설정
-    v_val = 50   # 속도
-    a_val = 50   # 각도
-    s_val = 1    # 상태 or 플래그
+    car_obj = latest_clusters[car_idx]
+    tgt_obj = latest_clusters[target_idx]
+    x1, y1 = polar_to_xy_cm(car_obj["angle"], car_obj["dist"])
+    x2, y2 = polar_to_xy_cm(tgt_obj["angle"], tgt_obj["dist"])
+    path = [(x1, y1)]
 
-    # 메시지 구성: v <50> a <50> s <1>
-    msg = 'v10a10s10\n'
-        
-    #     bytearray([
-    #     ord('v'), v_val & 0xFF,
-    #     ord('a'), a_val & 0xFF,
-    #     ord('s'), s_val & 0xFF
-    # ])
+    # --- BLOCK 피해서 우회 ---
+    if block_idx is not None:
+        blk_obj = latest_clusters[block_idx]
+        bx, by = polar_to_xy_cm(blk_obj["angle"], blk_obj["dist"])
+
+        # 차 → 블록, 블록 → 타겟 각도 계산
+        angle_car_blk = math.atan2(by - y1, bx - x1)
+        angle_blk_tgt = math.atan2(y2 - by, x2 - bx)
+
+        # 두 각도 차이를 보고 어느 쪽으로 피할지 결정 (왼쪽 or 오른쪽)
+        diff = (angle_blk_tgt - angle_car_blk + math.pi) % (2 * math.pi) - math.pi
+        avoid_dir = -1 if diff > 0 else 1  # +는 왼쪽, -는 오른쪽
+        AVOID_RADIUS = 25  # cm 단위 (회피 거리)
+
+        # 블록 중심을 기준으로 90도 회피점 생성
+        avoid_ang = math.atan2(y1 - by, x1 - bx) + avoid_dir * math.pi / 2
+        ax = bx + AVOID_RADIUS * math.cos(avoid_ang)
+        ay = by + AVOID_RADIUS * math.sin(avoid_ang)
+        path.append((ax, ay))
+        print(f"[PATH] AVOID via ({ax:.1f}, {ay:.1f}) around BLOCK ({bx:.1f},{by:.1f})")
+
+    # --- 타겟 추가 ---
+    path.append((x2, y2))
+
+    # --- 세그먼트 계산 ---
+    segments = []
+    for i in range(1, len(path)):
+        x0, y0 = path[i - 1]
+        x1, y1 = path[i]
+        dx, dy = (x1 - x0), (y1 - y0)
+        dist = math.hypot(dx, dy)
+        angle_abs = math.degrees(math.atan2(dy, dx))
+        segments.append({"angle_abs": angle_abs, "dist": dist})
+
+    print(f"[PATH] {len(segments)} segments generated")
+
+    base_speed = 20
+    k = 0.5
+    MAX_V = 255
+    for i, seg in enumerate(segments):
+        prev_angle = segments[i - 1]["angle_abs"] if i > 0 else 0.0
+        delta_angle = seg["angle_abs"] - prev_angle
+        dist = seg["dist"]
+        speed = min(int(base_speed + k * dist), MAX_V)
+        seg["delta_angle"] = delta_angle
+        seg["speed"] = speed
+
+    # --- 즉시 경로 시각화 ---
+    attack_view = True
+    info(f"ATTACK path ready ({len(segments)} segments)")
+    waiting_ok = True
+    pygame.display.flip()   # 화면 즉시 갱신
+    time.sleep(0.3)         # 경로 표시 살짝 보이게
+
+    # --- 첫 번째 세그먼트 송신 ---
+    if len(segments) > 0:
+        first = segments[0]
+        pkt = build_packet(first["speed"], int(round(first["delta_angle"])), 0)
+        pkt_bytes = struct.pack('>I', pkt)
+        try:
+            ser_bt.write(pkt_bytes)
+            print(f"[BT TX] SEG0: speed={first['speed']}, angle={int(round(first['delta_angle']))}, dist={first['dist']:.1f}cm")
+        except Exception as e:
+            info(f"Transmission failed: {e}")
+            return
+
+    # --- 이후 나머지 세그먼트 전송 루프 ---
+    for i, seg in enumerate(segments[1:], start=1):
+        t0 = time.time()
+        next_ok = False
+        while time.time() - t0 < 10.0:
+            status_reply = read_bt_binary()
+            if status_reply == 1:
+                next_ok = True
+                print("[BT RX] status=1 → next segment")
+                break
+            time.sleep(0.05)
+
+        if not next_ok:
+            info("No status=1 response (segment aborted)")
+            return
+
+        # 다음 세그먼트 전송
+        pkt = build_packet(seg["speed"], int(round(seg["delta_angle"])), 0)
+        pkt_bytes = struct.pack('>I', pkt)
+        try:
+            ser_bt.write(pkt_bytes)
+            print(f"[BT TX] SEG{i}: speed={seg['speed']}, angle={int(round(seg['delta_angle']))}, dist={seg['dist']:.1f}cm")
+        except Exception as e:
+            info(f"Transmission failed: {e}")
+            return
 
     try:
-        for ch in msg:
-            ser_bt.write(ch.encode('utf-8'))  # 문자 하나를 바이트로 변환해 전송
-        # print(f"[TX] '{ch}' -> {ord(ch)}")  # 로그: 문자와 ASCII 코드 출력
-        # time.sleep(0.01)  # (선택) 약간의 지연으로 안정성 확보
-            #ser_bt.write(msg)
-            time.sleep(0.05)  # 블루투스 안정화
-            print("[BT TX - RAW BYTES]", list(msg))  # 사람이 보기 쉽게 출력
-            info("테스트 명령 전송 완료. OK 신호 대기중...")
-            waiting_ok = True
+        ser_bt.write(b"END\n")
+        print("[BT TX] END")
+        info("ATTACK complete (avoid path)")
     except Exception as e:
-        info(f"전송 실패: {e}")
-
+        info(f"END send failed: {e}")
+ 
 # ---------- 메인 루프 ----------
 while True:
     for event in pygame.event.get():
@@ -363,6 +478,8 @@ while True:
                 select_mode = "CAR"
             elif btn_target.collidepoint(mx, my):
                 select_mode = "TARGET"
+            elif btn_block.collidepoint(mx, my):   # ✅ 이 한 줄 추가
+                select_mode = "BLOCK"
             elif btn_detect.collidepoint(mx, my):
                 start_detection_sweep()
             elif btn_attack.collidepoint(mx, my):
@@ -376,6 +493,8 @@ while True:
                             car_idx = idx
                         elif select_mode == "TARGET":
                             target_idx = idx
+                        elif select_mode == "BLOCK":   # ✅ BLOCK 지정 추가
+                            block_idx = idx
                         # 모드 유지(연속 지정 가능)
                         # select_mode = None
 
@@ -460,6 +579,7 @@ while True:
     draw_radar()
     draw_memory_objects()   # 스윕 중엔 빨간 점
     draw_clusters()         # 스윕 종료 후엔 클러스터(ATTACK 후엔 CAR/TARGET만)
+    draw_attack_path() 
     draw_line(angle)
     draw_text(angle, distance)
     draw_ui()
