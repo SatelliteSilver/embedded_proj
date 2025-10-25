@@ -465,7 +465,7 @@ def do_attack():
  
 # ---------- 메인 루프 ----------
 while True:
-    for event in pygame.event.get():
+    for event in pygame.event.get():    
         if event.type == pygame.QUIT:
             ser_radar.close()
             ser_bt.close()
