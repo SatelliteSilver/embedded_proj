@@ -1,21 +1,47 @@
-#include <Wire.h>
-#include "I2Cdev.h" // MPU9250 라이브러리 의존성
-#include "MPU9250.h" // MPU9250 자이로 센서 라이브러리
-#include <SoftwareSerial.h>
-SoftwareSerial mySerial(6, 7); // 아두이노 B(제어 보드)와 통신용
-// =========================================================================
-// ==                           전역 변수 및 상수                           ==
-// =========================================================================
+#include <AltSoftSerial.h>     // WT901용 (UNO: RX=8, TX=9 고정)
+#include <SoftwareSerial.h>    // 명령 포트용 (D6, D7)
 
-// ----- MPU9250 센서 관련 -----
-MPU9250 mpu;
-int16_t ax, ay, az, gx, gy, gz, mx, my, mz;
-float Axyz[3], Gxyz[3], Mxyz[3];
-float mx_centre = 382.5, my_centre = 139.0, mz_centre = 120.0; // 캘리브레이션 값 (반드시 재수행 필요)
-float currentHeading = 244.9; // setup()에서 덮어쓰므로 초기값 무의미
-float initialHeading = 0.0;
+AltSoftSerial imuSerial;       // IMU on D8(RX), D9(TX)
+#define IMU_SERIAL imuSerial
 
-// ----- 모터 드라이버 핀 -----
+// Arduino B와 통신(명령/피드백)
+SoftwareSerial mySerial(6, 7); // RX, TX
+
+// ===== 전역 구조체 (WitMotion 형식 유지) =====
+struct SAngle { float Roll, Pitch, Yaw; };
+struct SAcc   { float X, Y, Z; };
+struct SGyro  { float X, Y, Z; };
+
+SAngle stcAngle; // 최종 각도 (deg)
+SAcc   stcAcc;   // 최종 가속도 (g)
+SGyro  stcGyro;  // 최종 각속도 (deg/s)
+
+// ===== 보조 벡터 (기존 코드 호환용) =====
+float Axyz[3] = {0}, Gxyz[3] = {0};
+
+// ===== 헤딩/상태 =====
+float currentHeading = 0.0f;   // 최종 출력 헤딩(도)
+float initialHeading = 0.0f;   // 시작시 기준 헤딩(도)
+float targetAngle    = 0.0f;   // 목표 절대 헤딩(도)
+int   targetSpeed    = 0;
+bool  newCommandReceived = false;
+
+// Zero(영점) 기능용
+float yawZeroOffset = 0.0f;    // 현재 헤딩을 0으로 만들기 위한 오프셋
+float lastOutYaw    = 0.0f;    // LPF 전개 후 내부 outYaw(영점 계산에 사용)
+
+// 상태머신
+enum RobotState { IDLE, ROTATING, MOVING };
+RobotState currentState = IDLE;
+
+unsigned long moveStartTime = 0;
+
+// ===== PID =====
+float Kp = 4.0f;
+float Ki = 0.0f;
+float Kd = 0.1f;
+
+// ===== 모터 핀/파라미터 =====
 #define ENA 3
 #define IN1 4
 #define IN2 5
@@ -23,69 +49,60 @@ float initialHeading = 0.0;
 #define IN3 12
 #define IN4 13
 
-// ----- PID 제어 상수 [!! 튜닝 필요 !!] -----
-// [수정] 모터 흔들림(진동) 현상을 잡기 위해 튜닝 시작 값으로 변경합니다.
-// Kp가 15.0이면 너무 높아 오버슈트가 발생할 가능성이 큽니다.
-float Kp = 4.0;  // 15.0 -> 4.0 (값을 낮춰서 시작)
-float Ki = 0.0;  // 0.01 -> 0.0 (튜닝을 위해 0에서 시작)
-float Kd = 0.1;  // 1.0 -> 0.1 (값을 낮춰서 시작)
-
-// ----- 모터 제어 파라미터 -----
-const int MIN_PWM = 40;       // 제자리 회전 시 최소 PWM
-const int MAX_PWM = 250;      // 최대 PWM
-const int MAX_MOVE_PWM = 150; // 직진 주행 시 최대 PWM
+const int MIN_PWM = 40;
+const int MAX_PWM = 250;
+const int MAX_MOVE_PWM = 150;
 const int INITIAL_MOVE_SPEED = 50;
 const int INITIAL_MOVE_DURATION = 500; // ms
 const unsigned long MOVE_DURATION = 2000; // ms
 
-// ----- 목표 값 및 상태 변수 -----
-float targetAngle = 0.0;
-int   targetSpeed = 0;
-bool  newCommandReceived = false;
-enum RobotState { IDLE, ROTATING, MOVING };
-RobotState currentState = IDLE;
-unsigned long moveStartTime = 0;
-
-// ----- UART 통신 설정 -----
-#define UART_BAUD_RATE 115200 // USB 시리얼 모니터용
-// mySerial(6, 7)은 115200으로 setup()에서 설정됨
-
+// ===== UART & 디버그 =====
+#define UART_BAUD_RATE 115200
 #define UART_BUFFER_SIZE 32
 char uartBuffer[UART_BUFFER_SIZE];
 byte uartBufferIndex = 0;
 
+#define DEBUG 1
+unsigned long lastDbgMs = 0;
+const unsigned long DBG_PERIOD_MS = 200;
 
-// =========================================================================
-// ==                           유틸리티 함수                             ==
-// =========================================================================
+// 프레임 카운터(1초마다 표시)
+uint32_t accCnt=0, gyrCnt=0, angCnt=0, lastCountMs=0;
 
-/**
- * @brief 각도를 0.0 ~ 359.9... 범위로 정규화합니다.
- */
+// ===== 제어 유틸 =====
 static inline float wrap360(float angle) {
-  while (angle < 0.0) angle += 360.0;
-  while (angle >= 360.0) angle -= 360.0;
+  while (angle < 0.0f) angle += 360.0f;
+  while (angle >= 360.0f) angle -= 360.0f;
   return angle;
 }
-
-/**
- * @brief 두 각도 사이의 최단 차이(-180 ~ +180)를 계산합니다.
- */
-float angleDiff(float target, float current) {
+static inline float angleDiff(float target, float current) {
   float diff = wrap360(target) - wrap360(current);
-  if (diff >= 180.0)  diff -= 360.0;
-  if (diff < -180.0) diff += 360.0;
+  if (diff >= 180.0f)  diff -= 360.0f;
+  if (diff < -180.0f)  diff += 360.0f;
   return diff;
 }
 
-// =========================================================================
-// ==                           모터 제어 함수                            ==
-// =========================================================================
+// 회전 데드밴드(이 정도면 회전 생략)
+const float ANGLE_DEADBAND = 3.0f;
 
-/**
- * @brief 모터 1개를 제어합니다.
- * @param speed -255(역회전) ~ +255(정회전). 0은 정지.
- */
+// 움직임 플래그 (모터 명령이 실제로 나가는지 판단)
+bool moving = false;
+
+// 출력 LPF 계수 (헤딩 안정화)
+const float LPF_ALPHA = 0.25f;
+
+// ===== 디버그 1줄 출력 =====
+void dbgPrintStateLine(const char* tag, float err) {
+  if (!DEBUG) return;
+  Serial.print(tag); Serial.print(" | STATE=");
+  Serial.print((int)currentState);        // 0:IDLE, 1:ROTATING, 2:MOVING
+  Serial.print(" v=");  Serial.print(targetSpeed);
+  Serial.print(" hdg="); Serial.print(currentHeading, 1);
+  Serial.print(" tgt="); Serial.print(targetAngle, 1);
+  Serial.print(" err="); Serial.println(err, 1);
+}
+
+// ===== 모터 제어 =====
 void driveOneMotor(int EN_pin, int IN1_pin, int IN2_pin, int speed) {
   speed = constrain(speed, -255, 255);
   if (speed > 0) {
@@ -95,374 +112,399 @@ void driveOneMotor(int EN_pin, int IN1_pin, int IN2_pin, int speed) {
     digitalWrite(IN1_pin, LOW); digitalWrite(IN2_pin, HIGH);
     analogWrite(EN_pin, -speed);
   } else {
-    digitalWrite(IN1_pin, HIGH); digitalWrite(IN2_pin, HIGH); // 브레이크
+    digitalWrite(IN1_pin, LOW); digitalWrite(IN2_pin, LOW);
     analogWrite(EN_pin, 0);
   }
 }
 
-/**
- * @brief 제자리 회전을 위한 차동 구동 설정
- * @param leftSpeed -MAX_PWM ~ +MAX_PWM
- * @param rightSpeed -MAX_PWM ~ +MAX_PWM
- */
 void setMotorSpeedDifferential(int leftSpeed, int rightSpeed) {
-  leftSpeed = constrain(leftSpeed, -MAX_PWM, MAX_PWM);
+  leftSpeed  = constrain(leftSpeed,  -MAX_PWM, MAX_PWM);
   rightSpeed = constrain(rightSpeed, -MAX_PWM, MAX_PWM);
-  
-  int actualLeftSpeed = 0, actualRightSpeed = 0;
-  int turnPWM = 0;
 
-  // 이 로직은 한쪽이 +이면 다른 쪽은 -가 되도록 하여 제자리 회전을 유도합니다.
-  if (rightSpeed > leftSpeed) { // 우회전 (leftSpeed < 0, rightSpeed > 0)
-    turnPWM = constrain(rightSpeed, MIN_PWM, MAX_PWM);
-    actualLeftSpeed = -turnPWM; actualRightSpeed = turnPWM;
-  } else if (leftSpeed > rightSpeed) { // 좌회전 (leftSpeed > 0, rightSpeed < 0)
-    turnPWM = constrain(leftSpeed, MIN_PWM, MAX_PWM);
-    actualLeftSpeed = turnPWM; actualRightSpeed = -turnPWM;
+  moving = (abs(leftSpeed) >= MIN_PWM || abs(rightSpeed) >= MIN_PWM);
+
+  if (!moving) {
+    driveOneMotor(ENA, IN1, IN2, 0);
+    driveOneMotor(ENB, IN3, IN4, 0);
+    return;
   }
-  // 속도가 0이면 driveOneMotor(0)에 의해 정지됩니다.
+
+  int actualLeftSpeed = 0, actualRightSpeed = 0;
+  int turnPWM;
+
+  if (abs(rightSpeed) >= abs(leftSpeed)) {   // 우회전 쪽 우선
+    turnPWM = max(MIN_PWM, abs(rightSpeed));
+    actualLeftSpeed = -turnPWM; actualRightSpeed =  turnPWM;
+  } else {                                   // 좌회전
+    turnPWM = max(MIN_PWM, abs(leftSpeed));
+    actualLeftSpeed =  turnPWM; actualRightSpeed = -turnPWM;
+  }
+
   driveOneMotor(ENA, IN1, IN2, actualLeftSpeed);
   driveOneMotor(ENB, IN3, IN4, actualRightSpeed);
 }
 
-/**
- * @brief 두 모터를 같은 속도로 구동 (직진/후진)
- * @param speed -MAX_MOVE_PWM ~ +MAX_MOVE_PWM
- */
 void moveAtSpeed(int speed) {
-  // [참고] 후진을 막는 로직은 handleUartInput()에 있으므로
-  // 이 함수 자체는 후진(음수)도 가능하도록 둡니다. (초기화 동작 등에서 사용 가능)
   speed = constrain(speed, -MAX_MOVE_PWM, MAX_MOVE_PWM);
-  driveOneMotor(ENA, IN1, IN2, speed);
-  driveOneMotor(ENB, IN3, IN4, speed);
+  int corrected = -speed; // 전진/후진 방향 반전 필요 시 사용
+  moving = (abs(corrected) >= MIN_PWM);
+  driveOneMotor(ENA, IN1, IN2, corrected);
+  driveOneMotor(ENB, IN3, IN4, corrected);
 }
 
-// =========================================================================
-// ==                       센서 처리 및 각도 계산 함수                     ==
-// =========================================================================
+// =====================================================
+// ================= WT901 파싱 파트 ====================
+// =====================================================
 
-void getAccel_Data(void) {
-  mpu.getAcceleration(&ax, &ay, &az);
-  float accelSensitivity = 8192.0; // FS=4G (setFullScaleAccelRange)
-  Axyz[0] = (float)ax / accelSensitivity;
-  Axyz[1] = (float)ay / accelSensitivity;
-  Axyz[2] = (float)az / accelSensitivity;
-}
+// WT901 Baud (모듈 설정과 반드시 동일)
+const unsigned long WT901_BAUD = 9600;
 
-void getGyro_Data(void) {
-  mpu.getRotation(&gx, &gy, &gz);
-  float gyroSensitivity = 65.5; // FS=500DPS (setFullScaleGyroRange)
-  Gxyz[0] = (float)gx / gyroSensitivity;
-  Gxyz[1] = (float)gy / gyroSensitivity;
-  Gxyz[2] = (float)gz / gyroSensitivity;
-}
+// WT901 프레임: 11바이트, 0x55 0x51(Acc)/0x52(Gyro)/0x53(Angle)
+uint8_t imuFrame[11];
+uint8_t imuIdx = 0;
 
-void getCompass_Data_Raw(void) {
-  mpu.getMotion9(&ax, &ay, &az, &gx, &gy, &gz, &mx, &my, &mz);
-}
-
-void applyCompassCalibration() {
-  Mxyz[0] = (float)mx - mx_centre;
-  Mxyz[1] = (float)my - my_centre;
-  Mxyz[2] = (float)mz - mz_centre;
-}
-
-void calculateTiltHeading(void) {
-  float roll_rad = atan2(Axyz[1], Axyz[2]);
-  float pitch_rad = atan2(-Axyz[0], sqrt(Axyz[1] * Axyz[1] + Axyz[2] * Axyz[2]));
-  float cos_roll = cos(roll_rad), sin_roll = sin(roll_rad);
-  float cos_pitch = cos(pitch_rad), sin_pitch = sin(pitch_rad);
-  
-  // 틸트 보정 (수평면 자기장 계산)
-  float mag_x_horiz = Mxyz[0] * cos_pitch + Mxyz[1] * sin_roll * sin_pitch + Mxyz[2] * cos_roll * sin_pitch;
-  float mag_y_horiz = Mxyz[1] * cos_roll - Mxyz[2] * sin_roll;
-  
-  float heading_rad = atan2(-mag_y_horiz, mag_x_horiz);
-  currentHeading = wrap360(heading_rad * 180.0 / PI);
+inline bool wt901CheckSumOK(const uint8_t* f) {
+  uint8_t sum = 0;
+  for (int i = 0; i < 10; ++i) sum += f[i];
+  return (sum == f[10]);
 }
 
 void imuSetup() {
-  Wire.begin();
-  mpu.initialize();
-  if (mpu.testConnection()) {
-    mpu.setFullScaleGyroRange(MPU9250_GYRO_FS_500);
-    mpu.setFullScaleAccelRange(MPU9250_ACCEL_FS_4);
-    mpu.setDLPFMode(MPU9250_DLPF_BW_42); // 저역 통과 필터
-  } else {
-    // 연결 실패 시 정지
-    while (1); 
+  IMU_SERIAL.begin(WT901_BAUD);  // AltSoftSerial
+}
+
+// WT901 바이트 스트림을 파싱해 stcAcc/stcGyro/stcAngle 갱신
+void imuPollWT901() {
+  while (IMU_SERIAL.available()) {
+    uint8_t c = (uint8_t)IMU_SERIAL.read();
+
+    if (imuIdx == 0) {
+      if (c != 0x55) continue;
+      imuFrame[imuIdx++] = c;
+      continue;
+    }
+
+    imuFrame[imuIdx++] = c;
+
+    // 두 번째 바이트가 0x51/0x52/0x53가 아니면 프레임 재동기화
+    if (imuIdx == 2) {
+      if (imuFrame[1] != 0x51 && imuFrame[1] != 0x52 && imuFrame[1] != 0x53) {
+        imuIdx = (c == 0x55) ? 1 : 0;
+      }
+    }
+
+    if (imuIdx == 11) {
+      imuIdx = 0;
+      if (!wt901CheckSumOK(imuFrame)) continue;
+
+      // 데이터 해석 (리틀엔디언)
+      auto s16 = [&](int lo, int hi) -> int16_t {
+        return (int16_t)((imuFrame[hi] << 8) | imuFrame[lo]);
+      };
+
+      if (imuFrame[1] == 0x51) {
+        // Acc: raw/32768 * 16  [g]
+        stcAcc.X = (float)s16(2,3) / 32768.0f * 16.0f;
+        stcAcc.Y = (float)s16(4,5) / 32768.0f * 16.0f;
+        stcAcc.Z = (float)s16(6,7) / 32768.0f * 16.0f;
+        Axyz[0] = stcAcc.X; Axyz[1] = stcAcc.Y; Axyz[2] = stcAcc.Z;
+        accCnt++;
+      } else if (imuFrame[1] == 0x52) {
+        // Gyro: raw/32768 * 2000 [deg/s]
+        stcGyro.X = (float)s16(2,3) / 32768.0f * 2000.0f;
+        stcGyro.Y = (float)s16(4,5) / 32768.0f * 2000.0f;
+        stcGyro.Z = (float)s16(6,7) / 32768.0f * 2000.0f;
+        Gxyz[0] = stcGyro.X; Gxyz[1] = stcGyro.Y; Gxyz[2] = stcGyro.Z;
+        gyrCnt++;
+      } else if (imuFrame[1] == 0x53) {
+        // Angle: raw/32768 * 180 [deg]  (Yaw 범위 -180~+180)
+        stcAngle.Roll  = (float)s16(2,3) / 32768.0f * 180.0f;
+        stcAngle.Pitch = (float)s16(4,5) / 32768.0f * 180.0f;
+        stcAngle.Yaw   = (float)s16(6,7) / 32768.0f * 180.0f;
+        angCnt++;
+      }
+    }
   }
 }
 
-// [!! 주의 !!] 이 함수는 USB Serial(0, 1핀)로만 동작합니다.
-// 아두이노 B를 0, 1핀에 연결하면 이 함수를 사용할 수 없습니다.
-void runCompassCalibration() {
-  Serial.println(F("=== 지자기 센서 칼리브레이션 ==="));
-  Serial.println(F("20초 동안 센서를 모든 방향으로 천천히 회전시켜 주세요."));
-  Serial.println(F("시작하려면 시리얼 모니터(USB)에 'ready'를 입력하세요."));
-  while (!Serial.find((char*)"ready"));
-  Serial.println(F("칼리브레이션 시작... 20초간 회전하세요."));
-
-  long startTime = millis(); long duration = 20000;
-  int16_t mx_max_cal = -32767, my_max_cal = -32767, mz_max_cal = -32767;
-  int16_t mx_min_cal = 32767, my_min_cal = 32767, mz_min_cal = 32767;
-
-  while (millis() - startTime < duration) {
-    getCompass_Data_Raw(); // 가속도/자이로도 같이 읽지만 지자기(mx,my,mz)만 사용
-    if (mx > mx_max_cal) mx_max_cal = mx; if (mx < mx_min_cal) mx_min_cal = mx;
-    if (my > my_max_cal) my_max_cal = my; if (my < my_min_cal) my_min_cal = my;
-    if (mz > mz_max_cal) mz_max_cal = mz; if (mz < mz_min_cal) mz_min_cal = mz;
-    delay(20);
-  }
-  mx_centre = (float)(mx_max_cal + mx_min_cal) / 2.0;
-  my_centre = (float)(my_max_cal + my_min_cal) / 2.0;
-  mz_centre = (float)(mz_max_cal + mz_min_cal) / 2.0;
-
-  Serial.println(F("칼리브레이션 완료!"));
-  Serial.print(F("계산된 중심 오프셋 (X, Y, Z): "));
-  Serial.print(mx_centre); Serial.print(F(", "));
-  Serial.print(my_centre); Serial.print(F(", ")); Serial.println(mz_centre);
-  Serial.println(F("============================="));
-  Serial.println(F("이 값들을 코드 상단의 전역 변수 값에 복사하세요."));
-  delay(1000);
-}
-
+// 기존 함수명 유지: 센서 갱신(Acc/Gyro/Angle 모두 반영)
 void imuUpdate() {
-  getAccel_Data(); // 가속도 값 (Axyz) 업데이트
-  getCompass_Data_Raw(); // mx, my, mz 값 업데이트
-  applyCompassCalibration(); // Mxyz 값 업데이트
-  calculateTiltHeading(); // currentHeading 값 업데이트
+  imuPollWT901();   // AltSoftSerial은 listen() 필요 없음
 }
 
-// =========================================================================
-// ==                       PID 제어 및 회전 함수                         ==
-// =========================================================================
+// WT901의 Yaw를 사용해 헤딩 산출(LPF)
+//  + B) Zero 기능 반영 (yawZeroOffset 적용, lastOutYaw 갱신)
+void updateHeadingFused() {
+  static bool init = true;
+  static float outYaw = 0.0f;
 
-/**
- * @brief PID 제어를 사용하여 목표 절대 각도로 회전합니다.
- * @param targetAbsAngle 목표 절대 각도 (0~360)
- * @return true: 성공, false: 타임아웃
- */
+  // WT901 Yaw는 -180~+180 → 0~360으로 정규화
+  float measured = wrap360(stcAngle.Yaw < 0 ? (stcAngle.Yaw + 360.0f) : stcAngle.Yaw);
+
+  if (init) {
+    outYaw = measured;
+    init = false;
+  } else {
+    float d = angleDiff(measured, outYaw);
+    outYaw = wrap360(outYaw + LPF_ALPHA * d);
+  }
+
+  lastOutYaw = outYaw; // 영점 설정 시 사용
+
+  // Zero 오프셋 적용
+  currentHeading = wrap360(outYaw - yawZeroOffset);
+}
+
+// 각도만 전송 (절대 헤딩) — 회전/주행 완료 시점에만 호출
+void sendHeadingFrame() {
+  mySerial.print("h,");
+  mySerial.print(currentHeading, 1);
+  mySerial.print('\n');
+}
+
+// ===== PID 회전 =====
 bool rotateToAbsAngle(float targetAbsAngle) {
-  float currentAbsAngle = 0.0, error = 0.0;
-  float integral = 0.0, lastError = 0.0, derivative = 0.0;
+  float error = 0.0f;
+  float integral = 0.0f, lastError = 0.0f, derivative = 0.0f;
   int correction = 0;
-  
-  const float tolerance = 2.0; // 목표 각도 허용 오차 (도)
-  unsigned long lastTime = micros(), startTime = millis();
-  const unsigned long TIMEOUT_DURATION = 15000; // 15초 타임아웃
 
-  do {
-    // 타임아웃 검사
-    if (millis() - startTime > TIMEOUT_DURATION) {
-      setMotorSpeedDifferential(0, 0); // 모터 정지
-      return false; // 실패 반환
+  const float tolerance = 2.0f;
+  unsigned long lastTime = micros(), startTime = millis();
+  unsigned long lastPrintMs = millis();
+
+  while (true) {
+    if (millis() - startTime > 15000UL) {    // 타임아웃
+      setMotorSpeedDifferential(0, 0);
+      return false;
     }
 
     unsigned long currentTime = micros();
-    float deltaTime = (currentTime - lastTime) / 1000000.0; // 초 단위 시간 변화
+    float deltaTime = (currentTime - lastTime) / 1000000.0f;
     lastTime = currentTime;
-    if (deltaTime <= 0) deltaTime = 0.01; // 루프가 너무 빠를 경우 대비
+    if (deltaTime <= 0) deltaTime = 0.01f;
 
-    imuUpdate(); // 현재 각도(currentHeading) 업데이트
-    currentAbsAngle = currentHeading;
-    error = angleDiff(targetAbsAngle, currentAbsAngle); // 목표-현재 최단 각도
+    imuUpdate();           // WT901 프레임 처리
+    updateHeadingFused();  // 헤딩 갱신
 
-    // PID 계산
-    integral += error * deltaTime; // 오차 적분
-    // Ki가 0이 아니면 integral 값이 무한히 커지는 것을 방지(Integral Windup)하는 로직이 필요할 수 있습니다.
-    
-    derivative = (deltaTime > 0) ? (error - lastError) / deltaTime : 0; // 오차 미분
+    error = angleDiff(targetAbsAngle, currentHeading);
+
+    if (DEBUG && millis() - lastPrintMs >= 100) {
+      lastPrintMs = millis();
+      dbgPrintStateLine("[ROT]", error);
+    }
+
+    if (abs(error) <= ANGLE_DEADBAND) {
+      setMotorSpeedDifferential(0, 0);
+      return true;
+    }
+
+    // PID
+    integral += error * deltaTime;
+    derivative = (deltaTime > 0) ? (error - lastError) / deltaTime : 0;
     lastError = error;
 
-    correction = round(Kp * error + Ki * integral + Kd * derivative);
+    correction = (int)round(Kp * error + Ki * integral + Kd * derivative);
 
-    // PID 출력을 모터 속도로 변환
+    if (abs(correction) < MIN_PWM) {
+      correction = (correction >= 0) ? MIN_PWM : -MIN_PWM;
+    }
+    correction = constrain(correction, -MAX_PWM, MAX_PWM);
+
     int leftSpeed  = -correction;
-    int rightSpeed = correction;
-    
-    // setMotorSpeedDifferential 함수가 MIN_PWM ~ MAX_PWM 사이로 속도를 조절해줍니다.
+    int rightSpeed =  correction;
     setMotorSpeedDifferential(leftSpeed, rightSpeed);
 
-    delay(10); // 제어 루프 주기
-
-  } while (abs(error) > tolerance); // 오차가 허용 범위 밖인 동안 반복
-
-  setMotorSpeedDifferential(0, 0); // 목표 도달 시 모터 정지
-  return true; // 성공 반환
+    delay(10);
+  }
 }
 
-// =========================================================================
-// ==                       통신 및 명령어 처리 함수                      ==
-// =========================================================================
-
-/**
- * @brief "v...a...s..." 형식의 문자열을 파싱합니다.
- * @return true: 파싱 성공, false: 형식 오류
- */
+// ===== 명령 파싱/입력 =====
 bool parseCommand(const char* command, int &speed, float &angle, int &s_param) {
   const char* v_ptr = strchr(command, 'v');
   const char* a_ptr = strchr(command, 'a');
   const char* s_ptr = strchr(command, 's');
+  if (!v_ptr || !a_ptr || !s_ptr) return false;
 
-  if (v_ptr == NULL || a_ptr == NULL || s_ptr == NULL) {
-    return false; // 'v', 'a', 's' 중 하나라도 없으면 실패
-  }
-
-  // 각 포인터 다음 글자부터 숫자로 변환
   speed   = atoi(v_ptr + 1);
   angle   = atof(a_ptr + 1);
   s_param = atoi(s_ptr + 1);
-
   return true;
 }
 
+void handleInputFrom(Stream &port) {
+  while (port.available()) {
+    char incomingByte = port.read();
+    if (&port == &mySerial) Serial.write(incomingByte); // echo to USB
 
-/**
- * @brief mySerial(SoftwareSerial) 포트로 완료 신호를 전송합니다.
- */
-void sendCompletionSignal() {
-  imuUpdate(); // 최종 각도 업데이트
-  float finalRelativeAngle = angleDiff(currentHeading, initialHeading);
+    // ----- B) Zero 단축키: 'z' 또는 'Z' -----
+    if (incomingByte == 'z' || incomingByte == 'Z') {
+      // 현재 outYaw를 영점 기준으로 사용
+      imuUpdate(); updateHeadingFused(); // 최신화
+      yawZeroOffset = lastOutYaw;
+      initialHeading = currentHeading;   // 이제 0 근처
+      targetAngle    = initialHeading;
+      Serial.println("[ZERO] heading set to 0 deg");
+      uartBufferIndex = 0; // 버퍼 초기화
+      continue;
+    }
 
-  mySerial.print('a');
-  mySerial.print(finalRelativeAngle, 1); // 소수점 1자리
-  mySerial.println("s0"); // println이 \r\n을 붙여줌
-}
-
-/**
- * @brief mySerial(SoftwareSerial) 포트에서 입력을 처리합니다.
- */
-void handleUartInput() {
-  
-  if (mySerial.available()) {
-    char incomingByte = mySerial.read();
-    
-    // [디버깅용] 아두이노 B(제어보드)로부터 받은 데이터를 USB로 그대로 출력
-    Serial.write(incomingByte); 
-
-    if (incomingByte == '\n' || incomingByte == '\r') { // 명령어 종료 문자 수신
-      if (uartBufferIndex > 0) { // 버퍼에 데이터가 있다면
-        uartBuffer[uartBufferIndex] = '\0'; // 문자열 종료
-
-        int receivedSpeed;
-        float receivedAngle;
-        int receivedS;
-
+    if (incomingByte == '\n' || incomingByte == '\r') {
+      if (uartBufferIndex > 0) {
+        uartBuffer[uartBufferIndex] = '\0';
+        int receivedSpeed; float receivedAngle; int receivedS;
         if (parseCommand(uartBuffer, receivedSpeed, receivedAngle, receivedS)) {
-          // 파싱 성공
-          
-          // [수정] 후진(음수 속도) 방지. 0 ~ MAX_MOVE_PWM 사이로만 속도를 받음.
           targetSpeed = constrain(receivedSpeed, 0, MAX_MOVE_PWM);
-          
-          // [수정] 오타 수정 (wrap380 -> wrap360)
-          targetAngle = wrap360(initialHeading + receivedAngle); // 상대 각도를 절대 각도로 변환
-          
-          newCommandReceived = true;
+          targetAngle = wrap360(initialHeading + receivedAngle);
 
-          // 만약 이전 동작(이동 또는 회전) 중이었다면 즉시 정지
-          if (currentState == MOVING || currentState == ROTATING) {
-            setMotorSpeedDifferential(0, 0);
-            moveAtSpeed(0);
+          if (DEBUG) {
+            Serial.print("[CMD] v="); Serial.print(targetSpeed);
+            Serial.print(" a_rel=");  Serial.print(receivedAngle, 1);
+            Serial.print(" -> tgtAbs="); Serial.println(targetAngle, 1);
           }
-          currentState = ROTATING; // 새 명령을 받았으므로 '회전' 상태로 전환
-        } else {
-          // 명령어 형식 오류 (무시)
+
+          setMotorSpeedDifferential(0, 0);
+          moveAtSpeed(0);
+
+          imuUpdate();
+          updateHeadingFused();
+          float err = angleDiff(targetAngle, currentHeading);
+
+          if (abs(err) <= ANGLE_DEADBAND) {
+            if (targetSpeed > 0) {
+              currentState = MOVING;
+              moveStartTime = millis();
+              int startSpeed = max(targetSpeed, MIN_PWM); // 최소 PWM 보장
+              moveAtSpeed(startSpeed);
+              if (DEBUG) dbgPrintStateLine("[GO]", err);
+            } else {
+              sendHeadingFrame();
+              currentState = IDLE;
+            }
+          } else {
+            newCommandReceived = true;
+            currentState = ROTATING;
+          }
         }
       }
-      uartBufferIndex = 0; // 버퍼 인덱스 초기화
-
-    } else if (uartBufferIndex < (UART_BUFFER_SIZE - 1)) {
-      // 버퍼에 바이트 추가
+      uartBufferIndex = 0;
+    } else if (uartBufferIndex < (UART_BUFFER_SIZE - 1)) { // ★ 버그 수정: BAUD_RATE -> BUFFER_SIZE
       uartBuffer[uartBufferIndex++] = incomingByte;
     }
-    // 버퍼가 꽉 찼는데 종료 문자가 안 들어오면 다음 '\n'까지 데이터 유실 (정상)
   }
 }
 
+void handleUartInput() {
+  // 명령 포트(6,7) 수신
+  mySerial.listen();
+  handleInputFrom(mySerial);
+  handleInputFrom(Serial);   // USB 시리얼도 명령 허용(옵션)
+}
 
-// =========================================================================
-// ==                           메인 설정 및 루프                           ==
-// =========================================================================
-
+// ===== Arduino 기본 =====
 void setup() {
-  // USB 시리얼: 디버깅 및 캘리브레이션용 (115200)
-  Serial.begin(UART_BAUD_RATE); 
-  
-  // Software Serial: 아두이노 B(제어보드)와 통신용 (115200)
-  // [주의] 115200은 SoftwareSerial에 다소 불안정할 수 있습니다.
-  // 통신 오류가 발생하면 57600 또는 9600으로 낮추는 것을 고려하세요.
-  mySerial.begin(115200);
+  Serial.begin(UART_BAUD_RATE);     // PC 모니터 115200
+  mySerial.begin(115200);           // 명령 링크 115200
+  imuSetup();                       // WT901 9600
 
   pinMode(ENA, OUTPUT); pinMode(ENB, OUTPUT);
   pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
   pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
 
-  imuSetup(); // MPU9250 초기화
-  
-  // [!! 중요 !!]
-  // 캘리브레이션은 아두이노 B를 연결하기 전에(핀 6, 7 사용 전)
-  // USB(Serial)만 연결하고, 아래 주석을 해제하여 1회 실행해야 합니다.
-  // runCompassCalibration(); 
-  
-  // 초기화 동작: 잠깐 전진했다가 멈춤
+  // 기계 유격/정지 마찰 풀기
   moveAtSpeed(INITIAL_MOVE_SPEED); delay(INITIAL_MOVE_DURATION); moveAtSpeed(0);
-  delay(1000); // 센서 안정화 대기
-  
-  // 초기 헤딩 값 설정
-  for (int i = 0; i < 10; i++) { imuUpdate(); delay(50); } // 평균을 위해 여러 번 읽기
-  initialHeading = currentHeading;
-  targetAngle = initialHeading; // 현재 각도를 목표 각도로 설정
+  delay(500);
 
-  currentState = IDLE; // 대기 상태로 시작
+  // ===== A) 초기 헤딩을 "유효 각도 수신 후"에 설정 =====
+  unsigned long t0 = millis();
+  uint16_t angSamples = 0;
+  float lastYawSample = 9999.0f;
+  while (millis() - t0 < 2000) {  // 최대 2초 대기
+    imuUpdate();
+    updateHeadingFused();
+    if (stcAngle.Yaw != lastYawSample) {
+      lastYawSample = stcAngle.Yaw;
+      angSamples++;
+      if (angSamples >= 5) break; // 최소 5회 각도 프레임
+    }
+    delay(10);
+  }
+
+  // 현재 헤딩을 0으로 쓰고 싶으면 아래 두 줄로 영점도 같이 맞춘다(선택)
+  yawZeroOffset = lastOutYaw;            // 현재 outYaw를 기준 0으로
+  updateHeadingFused();                  // currentHeading 갱신(거의 0 근처)
+
+  initialHeading = currentHeading;       // 0 근처
+  targetAngle    = initialHeading;
+
   Serial.println("Setup complete. Ready for commands.");
 }
 
 void loop() {
-
-  handleUartInput(); // 항상 SoftwareSerial 입력 확인
+  handleUartInput();
 
   switch (currentState) {
     case IDLE:
-      // 새 명령을 기다리며 대기
       break;
 
     case ROTATING:
       if (newCommandReceived) {
-        newCommandReceived = false; // 명령 처리 시작
-        
-        bool rotationSuccess = rotateToAbsAngle(targetAngle);
-        
-        if (rotationSuccess) {
-          if (targetSpeed != 0) { // 직진 속도 명령이 있었다면
+        newCommandReceived = false;
+
+        imuUpdate(); updateHeadingFused();
+        if (abs(angleDiff(targetAngle, currentHeading)) <= ANGLE_DEADBAND) {
+          if (targetSpeed != 0) {
             currentState = MOVING;
             moveStartTime = millis();
-            moveAtSpeed(targetSpeed); // 직진 시작
-          } else { // 제자리 회전만(speed 0) 하는 명령이었다면
-            sendCompletionSignal(); // mySerial로 완료 신호 전송
-            currentState = IDLE; // 대기 상태로 복귀
+            moveAtSpeed(max(targetSpeed, MIN_PWM)); // 최소 PWM 보장
+          } else {
+            sendHeadingFrame();
+            currentState = IDLE;
           }
-        } else { // 회전 타임아웃
-          sendCompletionSignal(); // 실패했어도 완료 신호 전송
+          break;
+        }
+
+        if (rotateToAbsAngle(targetAngle)) {
+          if (targetSpeed != 0) {
+            currentState = MOVING;
+            moveStartTime = millis();
+            moveAtSpeed(max(targetSpeed, MIN_PWM)); // 최소 PWM 보장
+          } else {
+            sendHeadingFrame();
+            currentState = IDLE;
+          }
+        } else {
+          sendHeadingFrame();
           currentState = IDLE;
         }
       }
       break;
 
     case MOVING:
-      // MOVE_DURATION 동안 직진
       if (millis() - moveStartTime >= MOVE_DURATION) {
-        moveAtSpeed(0); // 시간 다 되면 정지
-        sendCompletionSignal(); // mySerial로 완료 신호 전송
-        currentState = IDLE; // 대기 상태로 복귀
+        moveAtSpeed(0);
+        sendHeadingFrame();
+        currentState = IDLE;
       }
       break;
   }
 
-  // [디버깅용] 현재 상태를 USB 시리얼 모니터로 출력
-  // Serial.print("Heading: "); Serial.print(currentHeading);
-  // Serial.print(" Target: "); Serial.print(targetAngle);
-  // Serial.print(" State: "); Serial.println(currentState);
+  imuUpdate();
+  updateHeadingFused();
 
-  delay(50); // 메인 루프 안정화
+  if (DEBUG && millis() - lastDbgMs >= DBG_PERIOD_MS) {
+    lastDbgMs = millis();
+    float errDbg = angleDiff(targetAngle, currentHeading);
+    dbgPrintStateLine("[HDG]", errDbg);
+  }
+
+  // 1초마다 프레임 카운터 출력
+  if (millis() - lastCountMs >= 1000) {
+    lastCountMs = millis();
+    Serial.print("[CNT] acc="); Serial.print(accCnt);
+    Serial.print(" gyr="); Serial.print(gyrCnt);
+    Serial.print(" ang="); Serial.println(angCnt);
+    accCnt=gyrCnt=angCnt=0;
+  }
+
+  delay(20);
 }
