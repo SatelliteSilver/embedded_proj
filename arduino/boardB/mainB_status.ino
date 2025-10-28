@@ -20,7 +20,7 @@ void printBinary32(uint32_t value) {
 void setup() {
   Serial.begin(115200);   // 하드웨어 UART (D0/D1) → 아두이노B 연결
   btSerial.begin(115200); // 블루투스 모듈 (HC-05) 연결
-  Serial.println("Bluetooth → UART Bridge Ready");
+  Serial.println("Bluetooth → UART Bridge Ready"); // 보드에 올릴시 반드시 주석처리
 }
 
 void loop() {
@@ -39,10 +39,13 @@ void loop() {
     rxQueue.dequeue(b3);
     rxQueue.dequeue(b4);
 
-    // 그대로 하드웨어 UART(D0/D1)로 전송 (→ CAR 아두이노)
+    // 그대로 하드웨어 UART(D0/D1)로 전송 (→ CAR 아두이노) 
     Serial.write(b1);
+    delay(200);
     Serial.write(b2);
+    delay(200);
     Serial.write(b3);
+    delay(200);
     Serial.write(b4);
   }
 
