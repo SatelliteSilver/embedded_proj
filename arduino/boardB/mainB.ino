@@ -10,12 +10,14 @@ SoftwareSerial btSerial(2, 3);  // RX=2, TX=3
 
 UartQueue rxQueue;   // 블루투스 수신 버퍼
 
+// --디버깅용 보드에 올릴시 주석처리!!!!!!---///
 void printBinary32(uint32_t value) {
   for (int i = 31; i >= 0; i--) {
     Serial.print((value >> i) & 1);
     if (i % 4 == 0) Serial.print(" ");
   }
 }
+//---------------------------------------///
 
 void setup() {
   Serial.begin(115200);   // 하드웨어 UART (D0/D1) → 아두이노B 연결
@@ -52,6 +54,7 @@ void loop() {
     Delay(500);
     Serial.write(b4);
 
+    // 🧠 시리얼 모니터 출력 (디코딩용) 
     uint8_t speed_type = (packet >> 30) & 0x03;
     uint8_t speed_val  = (packet >> 22) & 0xFF;
     uint8_t angle_type = (packet >> 20) & 0x03;
@@ -60,8 +63,10 @@ void loop() {
     uint8_t mode_val   = (packet >> 2)  & 0xFF;
     uint8_t reserved   = packet & 0x03;
 
-    // DEBUG //
-    // printBinary32(packet);
+    // Serial.print("\n[BT→UART] HEX=0x");
+    // Serial.print(packet, HEX);
+    // Serial.print("  BIN=");
+    // printBinary32(packet); // 디버깅할때 사용!!!!!! => 32bit 잘 나오는지 0100_1101.... 보드에 올릴때는 주석처리!
     // Serial.println();
 
     // Serial.print("  speed_val="); Serial.print(speed_val);
