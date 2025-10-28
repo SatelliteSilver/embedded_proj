@@ -453,10 +453,10 @@ void loop() {
     uint8_t reversed_b4 = reverseBits(b4); // 원래 MSB
 
     // ▼▼▼ 패킷 조립 순서 수정 (MSB first: b4, b3, b2, b1 LSB) ▼▼▼
-    uint32_t packet = ((uint32_t)reversed_b3 << 24) |
-                  ((uint32_t)reversed_b4 << 16) |
-                  ((uint32_t)reversed_b1 << 8)  |
-                  reversed_b2;
+    uint32_t packet = ((uint32_t)reversed_b1 << 24) |
+                  ((uint32_t)reversed_b2 << 16) |
+                  ((uint32_t)reversed_b3 << 8)  |
+                  reversed_b4;
                   
     // ▲▲▲ 패킷 조립 순서 수정 ▲▲▲
 
