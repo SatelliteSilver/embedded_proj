@@ -1,36 +1,30 @@
-
-//You have to download UartQueue.h, UartQueue.cpp, PacketProtocol.h in github arduino/library
-
+///board B 레지스터 코드!!!!!!!!!!!!!!!!!!/////
 #include <SoftwareSerial.h>
 #include "UartQueue.h"
 #include "PacketProtocol.h"
 
-// SoftwareSerial for Bluetooth
-SoftwareSerial btSerial(2, 3);  // RX=2, TX=3
-
-UartQueue rxQueue;   // 블루투스 수신 버퍼
-
-void printBinary32(uint32_t value) {
-  for (int i = 31; i >= 0; i--) {
-    Serial.print((value >> i) & 1);
-    if (i % 4 == 0) Serial.print(" ");
-  }
-}
+SoftwareSerial btSerial(2, 3);  // RX=2, TX=3 (SoftwareSerial)
+UartQueue rxQueue;
 
 void setup() {
-  Serial.begin(115200);   // 하드웨어 UART (D0/D1) → 아두이노B 연결
-  btSerial.begin(115200); // 블루투스 모듈 (HC-05) 연결
-  Serial.println("Bluetooth → UART Bridge Ready");
+  // 하드웨어 UART 직접 초기화 (D0/D1)
+  UBRR0H = 0;
+  UBRR0L = 16;                    // 115200 bps @ 16MHz
+  UCSR0A = (1 << U2X0);           // 2배속 모드
+  UCSR0B = (1 << RXEN0) | (1 << TXEN0);                 // 수신/송신 활성화
+  UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);               // 8N1
+
+  btSerial.begin(115200);         // 블루투스 시리얼
 }
 
 void loop() {
-  // 1️⃣ 블루투스 데이터 수신
+  // BT → 큐 적재
   while (btSerial.available()) {
     uint8_t b = btSerial.read();
     rxQueue.enqueue(b);
   }
 
-  // 2️⃣ 4바이트(32bit) 완성 시 처리
+  // 4바이트(32bit) 모이면 A 보드로 전송
   while (rxQueue.getLength() >= 4) {
     uint8_t b1, b2, b3, b4;
     rxQueue.dequeue(b1);
@@ -38,35 +32,19 @@ void loop() {
     rxQueue.dequeue(b3);
     rxQueue.dequeue(b4);
 
-    uint32_t packet = ((uint32_t)b1 << 24) |
-                      ((uint32_t)b2 << 16) |
-                      ((uint32_t)b3 << 8) |
-                      b4;
+    // 필요 시 여기에서 packet을 파싱해도 됨
+    // uint32_t packet = ((uint32_t)b1 << 24) |
+    //                   ((uint32_t)b2 << 16) |
+    //                   ((uint32_t)b3 << 8)  |
+    //                   b4;
 
-    // send UART(D0/D1) → board A
-    Serial.write(b1);
-    Delay(500);
-    Serial.write(b2);
-    Delay(500);
-    Serial.write(b3);
-    Delay(500);
-    Serial.write(b4);
-
-    uint8_t speed_type = (packet >> 30) & 0x03;
-    uint8_t speed_val  = (packet >> 22) & 0xFF;
-    uint8_t angle_type = (packet >> 20) & 0x03;
-    uint8_t angle_val  = (packet >> 12) & 0xFF;
-    uint8_t mode_type  = (packet >> 10) & 0x03;
-    uint8_t mode_val   = (packet >> 2)  & 0xFF;
-    uint8_t reserved   = packet & 0x03;
-
-    // DEBUG //
-    // printBinary32(packet);
-    // Serial.println();
-
-    // Serial.print("  speed_val="); Serial.print(speed_val);
-    // Serial.print("  angle_val="); Serial.print(angle_val);
-    // Serial.print("  mode_val="); Serial.print(mode_val);
-    // Serial.print("  reserved="); Serial.println(reserved);
+    // 하드웨어 UART 레지스터 직접 송신 (연속 전송)
+    while (!(UCSR0A & (1 << UDRE0))); UDR0 = b1;
+    delay(200);
+    while (!(UCSR0A & (1 << UDRE0))); UDR0 = b2;
+    delay(200);
+    while (!(UCSR0A & (1 << UDRE0))); UDR0 = b3;
+    delay(200);
+    while (!(UCSR0A & (1 << UDRE0))); UDR0 = b4;
   }
 }
