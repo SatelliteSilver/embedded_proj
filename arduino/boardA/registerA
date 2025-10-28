@@ -44,15 +44,15 @@ unsigned long moveStartTime = 0;
 float Kp = 4.0f, Ki = 0.0f, Kd = 0.1f;
 
 // ===== 모터 파라미터 =====
-const int MIN_PWM = 70;
-const int MAX_PWM = 100;
-const int MAX_MOVE_PWM = 100;
-const int INITIAL_MOVE_SPEED = 50;
+const int MIN_PWM = 250;
+const int MAX_PWM = 255;
+const int MAX_MOVE_PWM = 255;
+const int INITIAL_MOVE_SPEED = 250;
 const int INITIAL_MOVE_DURATION = 500;
 const unsigned long MOVE_DURATION = 2000;
 
 // ===== UART & 디버그 (Source 1) =====
-#define UART_BAUD_RATE 115200
+#define UART_BAUD_RATE 9600
 #define DEBUG 1
 unsigned long lastDbgMs = 0;
 const unsigned long DBG_PERIOD_MS = 200;
@@ -299,14 +299,18 @@ void setup() {
   PORTD &= ~(IN1_BIT | IN2_BIT); // D4, D5 LOW
   PORTB &= ~(IN3_BIT | IN4_BIT); // D12, D13 LOW
 
-  // 5. Timer2: Fast PWM, prescaler 32 (Source 2)
-  TCCR2A = 0; TCCR2B = 0;
-  TCCR2A |= (1<<WGM21) | (1<<WGM20);    // Fast PWM (Mode 3)
-  TCCR2A |= (1<<COM2A1) | (1<<COM2B1); // Non-inverting (Clear on match)
-  // CS22=0, CS21=1, CS20=1 -> Prescaler 32
-  TCCR2B |= (0<<CS22) | (1<<CS21) | (1<<CS20); 
+  // 5. Timer2: Fast PWM, prescaler 64 로 변경!
+  TCCR2A = 0;
+  TCCR2B = 0;
+  TCCR2A |= (1<<WGM21) | (1<<WGM20);    // Fast PWM (Mode 3, TOP=0xFF)
+  TCCR2A |= (1<<COM2A1) | (1<<COM2B1);  // Non-inverting on OC2A(D11), OC2B(D3)
+
+  // ★ prescaler = 64 로 설정 (CS22=1, CS21=0, CS20=0)
+  TCCR2B &= ~((1<<CS22)|(1<<CS21)|(1<<CS20)); // 기존 비트 클리어
+  TCCR2B |=  (1<<CS22);                       // CS22 비트만 1로 설정
+
   OCR2A = 0; // D11 PWM 초기화
-  OCR2B = 0; // D3 PWM 초기화
+  OCR2B = 0; // D3  PWM 초기화
 
   // 6. 시작 시 모터 워밍업 (Source 1)
   moveAtSpeed(INITIAL_MOVE_SPEED);
@@ -380,8 +384,7 @@ void loop() {
     uint8_t reversed_b3 = reverseBits(b3);
     uint8_t reversed_b4 = reverseBits(b4); 
 
-    // ▼▼▼ 패킷 조립 순서 (MSB first: b4, b3, b2, b1 LSB) ▼▼▼ 
-    // 만일 동작 안할시 시리얼 모니터 확인하고 여기 순서 확인!!!!!!!!!!!!!!!!////////////////////////////////////////////////
+    // ▼▼▼ 패킷 조립 순서 (MSB first: b4, b3, b2, b1 LSB) ▼▼▼
     // (Source 1의 조립 순서를 따름)
     uint32_t packet = ((uint32_t)reversed_b1 << 24) |
                       ((uint32_t)reversed_b2 << 16) |
