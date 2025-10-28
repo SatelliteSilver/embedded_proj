@@ -1,4 +1,4 @@
-//A 레지스터 코드로 변경/////////////////////////////////
+
 #include <AltSoftSerial.h>   // WT901용 (UNO: RX=8, TX=9 고정)
 #include "UartQueue.h"      // [추가] UART 큐 (Source 1)
 #include "PacketProtocol.h"   // [추가] 패킷 프로토콜 (Source 1)
@@ -380,7 +380,8 @@ void loop() {
     uint8_t reversed_b3 = reverseBits(b3);
     uint8_t reversed_b4 = reverseBits(b4); 
 
-    // ▼▼▼ 패킷 조립 순서 (MSB first: b4, b3, b2, b1 LSB) ▼▼▼
+    // ▼▼▼ 패킷 조립 순서 (MSB first: b4, b3, b2, b1 LSB) ▼▼▼ 
+    // 만일 동작 안할시 시리얼 모니터 확인하고 여기 순서 확인!!!!!!!!!!!!!!!!////////////////////////////////////////////////
     // (Source 1의 조립 순서를 따름)
     uint32_t packet = ((uint32_t)reversed_b1 << 24) |
                       ((uint32_t)reversed_b2 << 16) |
