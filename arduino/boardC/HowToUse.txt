@@ -1,0 +1,18 @@
+python 3.12 설치 권장
+
+아래 두 라이브러리 필요합니다. python 설치 후 pip 로 다운받아주세요
+pip install pygame
+pip install pyserial
+
+실행 전 
+1. main.py와 radar.py를 모두 다운
+2. 블루투스를 연결 > hc05와 페어링 후 COM 포트 번호 확인하여 해당 포트번호를 radar.py에서 수정
+3. board C와 포트 연결 > COM 포트 번호 확인하여 해당 포트번호를 radar.py에서 수정
+# port variables Init
+radar_port = 'COM10'
+bluetooth_port = 'COM9'
+  
+main.py 를 실행시켜 주시면 됩니다.
+
+실행 후에는 Detection 버튼을 눌러 초음파 센서로 물체를 탐지하면 되고
+탐지된 물체들 중 Car와 Target을 정하고 Block도 정하여 이동 경로를 지정한 뒤 Attack을 누르면 블루투스를 통해 해당 명령 정보가 전송됩니다. 
