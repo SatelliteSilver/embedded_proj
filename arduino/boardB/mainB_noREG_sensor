@@ -48,61 +48,6 @@ static int readDistanceCm(){
 }
 // ---------------- 설정 ----------------
 // 거리 전송 주기(ms)
-static const unsigned longDIST_TX_INTERVAL_MS = 100;// 10Hz 정도
-void setup(){
-  Serial.begin(115200);    // 보드A 측 하드웨어 UART (D0/D1)
-  btSerial.begin(115200);  // HC‑05 (D2/D3)
-  ultrasonicInit();
-  Serial.println("Bluetooth → UART Bridge + Ultrasonic Ready");
-}
-void loop() {
-  // 1) 블루투스 수신 -> 큐 적재
-  while (btSerial.available()) {
-    rxQueue.enqueue((uint8_t)btSerial.read());
-  }
-
-  // 2) 4바이트(32bit) 패킷 완성 시: 그대로 보드A(Serial)로 바이너리 전달
-  while (rxQueue.getLength() >= 4) {
-    uint8_t b1, b2, b3, b4;
-    rxQueue.dequeue(b1);
-    rxQueue.dequeue(b2);
-    rxQueue.dequeue(b3);
-    rxQueue.dequeue(b4);
-
-    // (디버깅 필요하면 packet 조립)
-    // uint32_t packet = ((uint32_t)b1 << 24) |
-    //                   ((uint32_t)b2 << 16) |
-    //                   ((uint32_t)b3 << 8)  |
-    //                   b4;
-
-    // Board A(유선)로 그대로 전달 (지연 최소화)
-    Serial.write(b1); delay(1);
-    Serial.write(b2); delay(1);
-    Serial.write(b3); delay(1);
-    Serial.write(b4); // 마지막 바이트 뒤에는 delay 생략 가능
-  }
-
-  // 3) 주기적으로 거리(cm) 값을 전송
-  static unsigned long lastDistMs = 0;
-  unsigned long now = millis();
-  if (now - lastDistMs >= DIST_TX_INTERVAL_MS) {
-    lastDistMs = now;
-    int cm = readDistanceCm();
-
-    // ▼ 원하는 방향만 활성화하세요 ▼
-    // (A) 보드A(유선)로 보내려면:
-    // Serial.print("DIST,"); Serial.println(cm);
-
-    // (B) 블루투스(PC)로 보내려면:
-    btSerial.print("DIST,"); btSerial.println(cm);
-  }
-
-  // 4) CAR → PC 릴레이 (Board A → Bluetooth)
-  // 유선(Serial)에 들어오는 모든 바이트를 블루투스(btSerial)로 전달
-  while (Serial.available()) {
-    uint8_t data_from_car = (uint8_t)Serial.read();
-    btSerial.write(data_from_car);
-  }
-}
+static const unsigned longDIST_TX_INTERVAL_MS = 100;고
 
 
