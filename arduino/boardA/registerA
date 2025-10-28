@@ -1,4 +1,4 @@
-
+//A 레지스터 코드로 변경/////////////////////////////////
 #include <AltSoftSerial.h>   // WT901용 (UNO: RX=8, TX=9 고정)
 #include "UartQueue.h"      // [추가] UART 큐 (Source 1)
 #include "PacketProtocol.h"   // [추가] 패킷 프로토콜 (Source 1)
