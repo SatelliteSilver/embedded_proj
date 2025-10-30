@@ -16,7 +16,37 @@ static uint8_t crc8_24(uint32_t upper24)
   }
   return crc;
 }
+// ==== B 보드: 초음파 & STOP 송신 ====
+static const uint8_t PIN_TRIG = A0;   // TRIG on A0
+static const uint8_t PIN_ECHO = A1;   // ECHO on A1
+static const uint8_t STOP_BYTE = 0xA5; // A와 합의한 긴급정지 바이트
 
+static const int STOP_THRESHOLD_CM = 4;            // 4cm 이하면 멈춤
+static const unsigned long DIST_INTERVAL_MS = 20;  // 측정 주기(≈50Hz)
+static const unsigned long STOP_COOLDOWN_MS = 100; // 연속 STOP 제한
+
+static unsigned long lastDistMs = 0;
+static unsigned long lastStopMs = 0;
+
+static void ultrasonicInit() {
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+  digitalWrite(PIN_TRIG, LOW);
+}
+
+static int readDistanceCmFast() {
+  // 10us 트리거
+  digitalWrite(PIN_TRIG, LOW);  delayMicroseconds(2);
+  digitalWrite(PIN_TRIG, HIGH); delayMicroseconds(10);
+  digitalWrite(PIN_TRIG, LOW);
+
+  // 근거리 반응 빠르게: 타임아웃 3ms
+  unsigned long dur = pulseIn(PIN_ECHO, HIGH, 3000UL);
+  if (dur == 0) return 0;       // 타임아웃/무효
+  int cm = (int)(dur / 58UL);   // cm ≈ us/58
+  if (cm > 160) return 0;       // 너무 먼 값 무효
+  return cm;
+}
 // ===== 여기 전역 변수들만 모아두기 =====
 const int DBG_LED_PIN = 7;
 static uint8_t  g_tx_seqbit  = 0;   // ✅ STATUS 보낼 때 토글
@@ -93,7 +123,7 @@ float Kp = 4.0f, Ki = 0.0f, Kd = 0.1f;
 // ===== 모터 파라미터 =====
 const int MIN_PWM = 140;
 // 회전 시에만 적용되는 최소 PWM (직진과 분리 조정)
-const int MIN_ROTATE_PWM = 90;
+const int MIN_ROTATE_PWM = 100;
 const int MAX_PWM = 250;
 const int MAX_MOVE_PWM = 255;
 const int INITIAL_MOVE_SPEED = 250;
@@ -293,7 +323,7 @@ void updateHeadingFused() {
   currentHeading = wrap360(outYaw - yawZeroOffset);
 }
 
-/*
+
 // [추가] ===== PID 회전 ===== (from Source 1)
 bool rotateToAbsAngle(float targetAbsAngle) {
   float error = 0.0f;
@@ -357,82 +387,8 @@ bool rotateToAbsAngle(float targetAbsAngle) {
     setMotorSpeedDifferentialWithMin(leftSpeed, rightSpeed, MIN_ROTATE_PWM);
     delay(10);
   } // end while
-}*/
-
-bool rotateToAbsAngle(float targetAbsAngle) {
-  float error = 0.0f;
-  float integral = 0.0f, lastError = 0.0f, derivative = 0.0f;
-  int correction = 0;
-
-  unsigned long lastTime = micros(), startTime = millis();
-  unsigned long lastPrintMs = millis();
-  while (true) {
-    if (millis() - startTime > 15000UL) {
-      setMotorSpeedDifferential(0, 0);
-      return false;
-    }
-
-    unsigned long currentTime = micros();
-    float deltaTime = (currentTime - lastTime) / 1000000.0f;
-    lastTime = currentTime;
-    if (deltaTime <= 0) deltaTime = 0.01f;
-
-    // ① IMU는 계속 읽어오고
-    imuUpdate();
-
-    // ② 회전 중에는 "필터 안 거친" 즉시 yaw 를 쓴다
-    float rawYaw = stcAngle.Yaw;
-    if (rawYaw < 0) rawYaw += 360.0f;     // 0~360도로
-    float heading_now = wrap360(rawYaw);  // 바로 현재 헤딩
-
-    error = angleDiff(targetAbsAngle, heading_now);
-
-    // 디버그 있으면 찍기
-    if (DEBUG && millis() - lastPrintMs >= 100) {
-      lastPrintMs = millis();
-      Serial.print("[ROT] tgt="); Serial.print(targetAbsAngle, 1);
-      Serial.print(" now=");      Serial.print(heading_now, 1);
-      Serial.print(" err=");      Serial.println(error, 1);
-    }
-
-    // ③ 충분히 가까우면 끝
-    if (abs(error) <= ANGLE_DEADBAND) {
-      setMotorSpeedDifferential(0, 0);
-      return true;
-    }
-
-    // ④ PID 그대로
-    integral += error * deltaTime;
-    derivative = (deltaTime > 0) ? (error - lastError) / deltaTime : 0;
-    lastError = error;
-    correction = (int)round(Kp * error + Ki * integral + Kd * derivative);
-
-    // ⑤ 타깃에 근접했을 때는 세게 안 돌게 살짝 줄여주기
-    int minPwm = MIN_ROTATE_PWM;  // 원래 100이었지
-    if (abs(error) < 25.0f) {     // 25도 안 쪽으로 들어오면
-      correction = correction / 2;
-      if (correction == 0) correction = (error > 0) ? 40 : -40;
-      minPwm = 50;                // 너무 세게 안 돌게
-    }
-
-    if (abs(correction) < minPwm) {
-      correction = (correction >= 0) ? minPwm : -minPwm;
-    }
-    correction = constrain(correction, -MAX_PWM, MAX_PWM);
-
-    int leftSpeed, rightSpeed;
-    if (error > 0) {
-      leftSpeed  =  abs(correction);
-      rightSpeed = -abs(correction);
-    } else {
-      leftSpeed  = -abs(correction);
-      rightSpeed =  abs(correction);
-    }
-
-    setMotorSpeedDifferentialWithMin(leftSpeed, rightSpeed, minPwm);
-    delay(10);
-  }
 }
+
 
 
 // [추가] 비트 리버스 함수 (from Source 1)
@@ -531,7 +487,36 @@ void setup() {
 
 // ===== Arduino 기본 Loop (Source 1 로직) =====
 void loop() {
+  unsigned long now = millis();
+  // 1️⃣ [수정] 초음파 비상 정지 로직
+  if (now - lastDistMs >= DIST_INTERVAL_MS) {
+    lastDistMs = now;
+    int cm = readDistanceCmFast();
 
+    if (cm > 0 && cm <= STOP_THRESHOLD_CM && (now - lastStopMs) >= STOP_COOLDOWN_MS) {
+      
+      // Serial.write(STOP_BYTE); // <-- [제거] A보드가 자기 자신에게 명령할 필요 없음
+      
+      // [추가] 모터가 움직이는 중에만 정지 명령 수행
+      if (currentState != IDLE) {
+          
+          // [추가] 모터를 즉시 멈춤
+          setMotorSpeedDifferential(0, 0); 
+          moveAtSpeed(0);                  
+          
+          // [추가] 상태를 즉시 IDLE로 변경
+          currentState = IDLE;
+          newCommandReceived = false;
+          targetSpeed = 0;
+          
+          // [추가] PC에서 오고 있던 명령 큐를 비워서 충돌 방지
+          rxQueue.clear(); 
+          
+          lastStopMs = now;
+          blinkThree(); // [선택] 비상 정지 시 LED 3번 점멸
+      }
+    }
+  }
   // 1️⃣ 수신 데이터 버퍼링 (읽을 때 비트 리버스 적용)
   while (Serial.available()) {
     // ▼▼▼ 여기서 첫 번째 reverseBits 적용 ▼▼▼
