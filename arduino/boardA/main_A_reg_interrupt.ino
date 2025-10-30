@@ -1,3 +1,34 @@
+// //----------------------------------------수정 부분만 설명 -------------------------------------------//
+/*메인 루프에서 항상 delay(20)을 했던것을  TIMER2 오버플로우 인터럽트로 수정 => 약20ms마다 틱 생성 -. 인터럽트 킴
+아래 순서 */
+
+// // 1) 인터럽트 헤더 추가
+// #include <avr/io.h>
+// #include <avr/interrupt.h>
+
+// // 2) delay(20) 대체용 전역 플래그/카운터
+// volatile uint8_t g_tick20ms = 0;
+// volatile uint8_t g_ovf_cnt  = 0;
+
+// // 3) Timer2 오버플로우 ISR (≈ 1.024ms/OVF, 20회 ≈ 20.48ms)
+// ISR(TIMER2_OVF_vect) {
+//   if (++g_ovf_cnt >= 20) {
+//     g_ovf_cnt = 0;
+//     g_tick20ms = 1;   // 20ms 틱 발생
+//   }
+// }
+
+// // 4) setup() 내부: Timer2 OVF 인터럽트 활성화 + 전역 인터럽트 허용
+// TIMSK2 |= (1<<TOIE2);   // Timer2 Overflow Interrupt Enable
+// sei();
+
+// // 5) loop() 맨 끝: 기존 delay(20) → 20ms 틱 플래그 대기
+// while (!g_tick20ms) { /* 인터럽트가 g_tick20ms 세울 때까지 대기 */ }
+// g_tick20ms = 0;
+// // -------------------------------------------------------------------------------------------------//
+
+
+
 #include <AltSoftSerial.h>
 #include "UartQueue.h"
 #include "PacketProtocol.h"
