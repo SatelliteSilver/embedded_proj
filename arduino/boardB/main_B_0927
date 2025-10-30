@@ -1,0 +1,166 @@
+#include <SoftwareSerial.h>
+#include "UartQueue.h"
+#include "PacketProtocol.h"
+
+// PC <-> B
+SoftwareSerial btSerial(2, 3);   // RX, TX
+
+// 큐
+UartQueue rxQueue;        // PC → B → A
+UartQueue statusRxQueue;  // A  → B → PC
+
+// 초음파 핀
+const int ULTRA_TRIG = 4;
+const int ULTRA_ECHO = 5;
+
+// 장애물 임계값
+const uint16_t STOP_DIST_CM = 15;   // 이 안이면 완전 정지
+const uint16_t SLOW_DIST_CM = 30;   // 이 안이면 감속
+const uint8_t  SLOW_SPEED   = 30;   // 감속시 최대속도
+
+// CRC-8(0x07) for bits 31..8
+static uint8_t crc8_24(uint32_t upper24) {
+  uint8_t crc = 0x00;
+  for (int i = 2; i >= 0; --i) {
+    uint8_t b = (upper24 >> (i * 8)) & 0xFF;
+    crc ^= b;
+    for (uint8_t k = 0; k < 8; ++k) {
+      if (crc & 0x80) crc = (crc << 1) ^ 0x07;
+      else            crc <<= 1;
+    }
+  }
+  return crc;
+}
+
+uint16_t readDistanceCm() {
+  digitalWrite(ULTRA_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(ULTRA_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(ULTRA_TRIG, LOW);
+
+  unsigned long echoUs = pulseIn(ULTRA_ECHO, HIGH, 20000UL);  // 20ms = 약 3.4m
+  if (echoUs == 0) return 0;   // 측정 실패
+  uint16_t cm = (uint16_t)(echoUs / 58);   // us → cm
+  return cm;
+}
+
+void setup() {
+  Serial.begin(9600);    // 하드웨어 UART → A
+  btSerial.begin(9600);  // 소프트웨어 UART → PC
+
+  pinMode(ULTRA_TRIG, OUTPUT);
+  pinMode(ULTRA_ECHO, INPUT);
+}
+
+// PC → B → A (장애물 체크)
+void handlePcToA() {
+  // 1) PC에서 들어온 바이트 수집
+  while (btSerial.available()) {
+    uint8_t b = (uint8_t)btSerial.read();
+    rxQueue.enqueue(b);
+  }
+
+  // 2) 4바이트씩 처리
+  while (rxQueue.getLength() >= 4) {
+    uint8_t b1, b2, b3, b4;
+    rxQueue.dequeue(b1);  // MSB
+    rxQueue.dequeue(b2);
+    rxQueue.dequeue(b3);
+    rxQueue.dequeue(b4);  // LSB
+
+    uint32_t pkt = ((uint32_t)b1 << 24) |
+                   ((uint32_t)b2 << 16) |
+                   ((uint32_t)b3 << 8)  |
+                   (uint32_t)b4;
+
+    uint8_t  rx_crc   = pkt & 0xFF;
+    uint32_t upper24  = pkt >> 8;
+    uint8_t  calc_crc = crc8_24(upper24);
+
+    // CRC가 0이 아니고 틀리면 버림
+    if (rx_crc != 0x00 && rx_crc != calc_crc) {
+      // 그냥 다음 패킷
+      continue;
+    }
+
+    // 상위 24비트 구조 (radar.py ver1과 동일)
+    // 23..22 : speed_type (01)
+    // 21..14 : speed_val  (0~255)
+    // 13..12 : angle_type (10)
+    // 11..4  : angle_val
+    // 3..2   : mode_type (11)
+    // 1      : status
+    // 0      : seq
+    uint8_t speed_type = (upper24 >> 22) & 0x03;
+    uint8_t speed_val  = (upper24 >> 14) & 0xFF;
+
+    // ===== 장애물 거리 체크 =====
+    uint16_t dist = readDistanceCm();
+    bool changed = false;
+
+    if (dist > 0 && dist < STOP_DIST_CM) {
+      // 바로 앞에 있으면 강제 정지
+      if (speed_type == 0x01 && speed_val != 0) {
+        speed_val = 0;
+        changed = true;
+      }
+    } else if (dist > 0 && dist < SLOW_DIST_CM) {
+      // 조금 가까우면 감속
+      if (speed_type == 0x01 && speed_val > SLOW_SPEED) {
+        speed_val = SLOW_SPEED;
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      // speed_val 자리(21..14)만 지우고 다시 넣기
+      upper24 &= ~(((uint32_t)0xFF) << 14);
+      upper24 |= ((uint32_t)speed_val) << 14;
+
+      // CRC 다시 계산
+      uint8_t new_crc = crc8_24(upper24);
+      pkt = (upper24 << 8) | new_crc;
+
+      // 다시 바이트로
+      b1 = (pkt >> 24) & 0xFF;
+      b2 = (pkt >> 16) & 0xFF;
+      b3 = (pkt >> 8)  & 0xFF;
+      b4 =  pkt        & 0xFF;
+    }
+
+    // 최종 패킷을 A로 보냄
+    Serial.write(b1);
+    Serial.write(b2);
+    Serial.write(b3);
+    Serial.write(b4);
+    Serial.flush();
+  }
+}
+
+// A → B → PC (STATUS 그대로)
+void handleAtoPc() {
+  while (Serial.available()) {
+    uint8_t b = (uint8_t)Serial.read();
+    statusRxQueue.enqueue(b);
+  }
+
+  while (statusRxQueue.getLength() >= 4) {
+    uint8_t b1,b2,b3,b4;
+    statusRxQueue.dequeue(b1);
+    statusRxQueue.dequeue(b2);
+    statusRxQueue.dequeue(b3);
+    statusRxQueue.dequeue(b4);
+
+    btSerial.write(b1);
+    btSerial.write(b2);
+    btSerial.write(b3);
+    btSerial.write(b4);
+    btSerial.flush();
+  }
+}
+
+void loop() {
+  handlePcToA();
+  handleAtoPc();
+}
