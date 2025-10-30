@@ -122,7 +122,7 @@ unsigned long moveStartTime = 0;
 float Kp = 4.0f, Ki = 0.0f, Kd = 0.1f;
 
 // ===== 모터 파라미터 =====
-const int MIN_PWM = 160;
+const int MIN_PWM = 180;
 const int MIN_ROTATE_PWM = 110;
 const int MAX_PWM = 250;
 const int MAX_MOVE_PWM = 255;
@@ -176,6 +176,14 @@ void dbgPrintStateLine(const char* tag, float err) {
 }
 
 // ===== 모터 제어 (Timer2 PWM: D3=OC2B, D11=OC2A) =====
+void forwardKick(uint8_t pwm, uint16_t ms) {
+  // 이 프로젝트는 전진이 (-)로 들어가 있으니까 그대로 맞춰
+  driveOneMotor(ENA, IN1, IN2, -pwm);
+  driveOneMotor(ENB, IN3, IN4, -pwm);
+  delay(ms);
+}
+
+
 void driveOneMotor(int EN_pin, int IN1_pin, int IN2_pin, int speed) {
   int pwmValue = abs(constrain(speed, -255, 255));
 
@@ -510,38 +518,34 @@ void loop() {
       continue;   // 다음 4바이트 보자
     }
 
-    // ---------- 디코딩 ----------
     uint8_t speed_type = (upper24 >> 22) & 0x03;  // 23..22
     uint8_t speed_val  = (upper24 >> 14) & 0xFF;  // 21..14
     uint8_t angle_type = (upper24 >> 12) & 0x03;  // 13..12
     uint8_t angle_val  = (upper24 >> 4)  & 0xFF;  // 11..4
-    // uint8_t mode_type  = (upper24 >> 2)  & 0x03;  // 3..2 (필요하면)
-    // uint8_t status_bit = (upper24 >> 1)  & 0x01;  // 1
-    // uint8_t seq_bit    =  upper24        & 0x01;  // 0
 
     blinkOnce();   // “패킷 하나 받았다” 표시
 
-    // 우리가 실제로 쓸 값
+
+    // 2) 여기서부터가 진짜 우리가 쓸 값
     int   new_v = 0;
     float new_a = 0.0f;
 
-    if (speed_type == 0x01) {
-      new_v = speed_val;
+    // --- 속도 해석 ---
+    // radar_ver1.py가 speed_type을 0b01로 보내니까 그거면 그냥 PWM으로 씀.
+    if (speed_type == 0x01) {          // 01 = "속도값 하나"
+      new_v = speed_val;               // 0~255 그대로
+    } else {
+      new_v = 0;                       // 다른 타입은 일단 0 처리
     }
 
-    if (angle_type == 0x02) {
-      // MSB=1이면 음수
-      if (angle_val & 0x80) {
-        new_a = -(float)(angle_val & 0x7F);
-      } else {
-        new_a =  (float)(angle_val & 0x7F);
-      }
-    }
-
-    // ★★★ 여기 추가한 부분: B가 “앞에 막혔다”고 v=0,a=0 보내면 바로 끝났다고 올려주기
-    if (new_v == 0 && new_a == 0.0f) {
-      sendCompletionStatus();
-      continue;   // 다음 패킷 보자
+    // --- 각도 해석 ---
+    // radar_ver1.py가 angle을 0b10로 보내고, 음수일 때는 2의 보수(= &0xFF)로 보내니까
+    // 여기서 int8_t 로 다시 부호를 살려줘야 함.
+    if (angle_type == 0x02) {          // 10b = 0x02
+      int8_t ang8 = (int8_t)angle_val; // 예: PC에서 -10보내면 여기서 -10나옴
+      new_a = (float)ang8;             // 단위: degree
+    } else {
+      new_a = 0.0f;
     }
 
     // ---------- 정상 세그먼트면 상태머신에 명령 넣기 ----------
@@ -554,7 +558,7 @@ void loop() {
       setMotorSpeedDifferential(0, 0);
       moveAtSpeed(0);
 
-      // 지금 헤딩 다시 읽고
+      // 지금 헤딩 다시 읽고…
       imuUpdate();
       updateHeadingFused();
       float err = angleDiff(targetAngle, currentHeading);
@@ -610,6 +614,8 @@ void loop() {
           if (targetSpeed > 0) {
             currentState  = MOVING;
             moveStartTime = millis();
+
+            forwardKick(255, 120);  // 120ms 정도 풀 PWM
             moveAtSpeed(max(targetSpeed, MIN_PWM));
           } else {
             currentState = IDLE;
